@@ -196,16 +196,21 @@ export default function App() {
 
   const handleStart = () => {
     const appRoot = document.documentElement;
-    if (!document.fullscreenElement && typeof appRoot.requestFullscreen === 'function') {
-      void appRoot.requestFullscreen().catch((error: unknown) => {
-        console.info('WOB fullscreen mode is unavailable:', error);
-      });
-    }
+    const requestLandscape = () => {
+      if (typeof screen.orientation?.lock === 'function') {
+        void screen.orientation.lock('landscape').catch((error: unknown) => {
+          console.info('WOB landscape orientation lock is unavailable:', error);
+        });
+      }
+    };
 
-    if (typeof screen.orientation?.lock === 'function') {
-      void screen.orientation.lock('landscape').catch((error: unknown) => {
-        console.info('WOB landscape orientation lock is unavailable:', error);
+    if (!document.fullscreenElement && typeof appRoot.requestFullscreen === 'function') {
+      void appRoot.requestFullscreen().then(requestLandscape).catch((error: unknown) => {
+        console.info('WOB fullscreen mode is unavailable:', error);
+        requestLandscape();
       });
+    } else {
+      requestLandscape();
     }
 
     setShowAchievements(false);

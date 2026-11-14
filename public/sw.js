@@ -1,9 +1,26 @@
 const CACHE_NAME = 'wob-shell-v1';
-const APP_SHELL = ['/', '/manifest.webmanifest', '/icons/wob-icon.svg'];
+const APP_SHELL = [
+  '/',
+  '/manifest.webmanifest',
+  '/icons/wob-icon.svg',
+  '/icons/wob-icon-180.png',
+  '/icons/wob-icon-192.png',
+  '/icons/wob-icon-512.png',
+];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)),
+    (async () => {
+      const cache = await caches.open(CACHE_NAME);
+      await cache.addAll(APP_SHELL);
+      const page = await cache.match('/');
+      const html = page ? await page.text() : '';
+      const builtAssets = Array.from(
+        html.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g),
+        (match) => match[1],
+      );
+      await cache.addAll(builtAssets);
+    })(),
   );
   self.skipWaiting();
 });
