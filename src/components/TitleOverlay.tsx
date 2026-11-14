@@ -7,6 +7,8 @@ interface TitleOverlayProps {
   totalAchievements: number;
   onStart: () => void;
   onToggleMute: () => void;
+  onInstall?: () => void;
+  installHelp?: boolean;
   onOpenLeaderboard: () => void;
   onOpenAchievements: () => void;
 }
@@ -18,13 +20,28 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
   totalAchievements,
   onStart,
   onToggleMute,
+  onInstall,
+  installHelp = false,
   onOpenLeaderboard,
   onOpenAchievements,
 }) => {
   return (
     <div className="absolute inset-0 z-20 flex flex-col justify-between p-5 sm:p-8 md:p-12 [@media(max-height:500px)]:p-3.5 pointer-events-none">
       {/* Top minimal utility corner */}
-      <div className="flex items-center justify-end">
+      <div className="flex items-center justify-end gap-2">
+        {onInstall && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.currentTarget.blur();
+              onInstall();
+            }}
+            aria-label="Install WOB"
+            className="pointer-events-auto flex items-center gap-2 px-3.5 py-2 text-xs font-medium tracking-wide text-[#0b0f19] bg-[#00f5d4] rounded-lg hover:bg-[#38ffe5] transition-colors cursor-pointer"
+          >
+            Install App
+          </button>
+        )}
         <button
           type="button"
           onClick={(e) => {
@@ -186,10 +203,15 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
       </div>
 
       {/* Single flat control-hint line in bottom safe margin */}
-      <div className="flex items-center justify-center sm:justify-start">
+      <div className="flex flex-col items-center sm:items-start gap-1">
         <p className="text-xs sm:text-sm [@media(max-height:500px)]:text-[11px] text-slate-400 tracking-wide font-mono-num">
           Arrows / Touch-Drag Move · S or Right-Click Shield · Q Polly Assist · Space Dash · E EMP · P Pause
         </p>
+        {installHelp && (
+          <p className="text-[11px] text-slate-500">
+            To install on iPhone or iPad: tap Share, then Add to Home Screen.
+          </p>
+        )}
       </div>
     </div>
   );

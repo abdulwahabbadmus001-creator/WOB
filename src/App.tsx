@@ -43,6 +43,11 @@ import type {
   UpgradeId,
 } from './game/types';
 
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
+
 const INITIAL_HUD: HudSnapshot = {
   mode: 'campaign',
   score: 0,
@@ -103,8 +108,32 @@ export default function App() {
   const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [showInitialsPrompt, setShowInitialsPrompt] = useState(false);
   const [savedRank, setSavedRank] = useState<number | null>(null);
+  const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
 
   const activeToast = toastQueue[0] ?? null;
+  const isIos =
+    /iphone|ipad|ipod/i.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isStandalone =
+    window.matchMedia('(display-mode: standalone)').matches ||
+    (navigator as Navigator & { standalone?: boolean }).standalone === true;
+
+  useEffect(() => {
+    const handleInstallAvailable = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as BeforeInstallPromptEvent);
+    };
+    const handleInstalled = () => {
+      setInstallPrompt(null);
+    };
+
+    window.addEventListener('beforeinstallprompt', handleInstallAvailable);
+    window.addEventListener('appinstalled', handleInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleInstallAvailable);
+      window.removeEventListener('appinstalled', handleInstalled);
+    };
+  }, []);
 
   useEffect(() => {
     engineRef.current?.setOverlayOpen(
@@ -166,10 +195,34 @@ export default function App() {
   }, []);
 
   const handleStart = () => {
+    const appRoot = document.documentElement;
+    if (!document.fullscreenElement && typeof appRoot.requestFullscreen === 'function') {
+      void appRoot.requestFullscreen().catch((error: unknown) => {
+        console.info('WOB fullscreen mode is unavailable:', error);
+      });
+    }
+
+    if (typeof screen.orientation?.lock === 'function') {
+      void screen.orientation.lock('landscape').catch((error: unknown) => {
+        console.info('WOB landscape orientation lock is unavailable:', error);
+      });
+    }
+
     setShowAchievements(false);
     setShowLeaderboard(false);
     setShowInitialsPrompt(false);
     engineRef.current?.startNewGame(true, 1, 1);
+  };
+
+  const handleInstall = async () => {
+    if (!installPrompt) return;
+    try {
+      await installPrompt.prompt();
+      await installPrompt.userChoice;
+      setInstallPrompt(null);
+    } catch (error) {
+      console.error('WOB installation prompt failed:', error);
+    }
   };
 
   const handleRetryChapter = (chapter: number) => {
@@ -257,6 +310,8 @@ export default function App() {
           totalAchievements={ACHIEVEMENT_CATALOG.length}
           onStart={handleStart}
           onToggleMute={handleToggleMute}
+          onInstall={installPrompt ? handleInstall : undefined}
+          installHelp={isIos && !isStandalone}
           onOpenLeaderboard={() => setShowLeaderboard(true)}
           onOpenAchievements={() => setShowAchievements(true)}
         />
