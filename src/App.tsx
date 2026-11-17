@@ -39,8 +39,11 @@ import type {
   GameState,
   HudSnapshot,
   LeaderboardEntry,
+  GameMode,
   RunSummary,
+  ShipSkin,
   UpgradeId,
+  WeaponType,
 } from './game/types';
 
 interface BeforeInstallPromptEvent extends Event {
@@ -50,6 +53,9 @@ interface BeforeInstallPromptEvent extends Event {
 
 const INITIAL_HUD: HudSnapshot = {
   mode: 'campaign',
+  dailyChallengeTitle: '',
+  dailyChallengeDescription: '',
+  empDisabled: false,
   score: 0,
   highScore: loadHighScore(),
   hp: 100,
@@ -194,7 +200,11 @@ export default function App() {
     };
   }, []);
 
-  const handleStart = () => {
+  const handleStart = (
+    mode: GameMode = 'campaign',
+    weapon: WeaponType = 'spread',
+    skin: ShipSkin = 'cyan',
+  ) => {
     const appRoot = document.documentElement;
     const requestLandscape = () => {
       if (typeof screen.orientation?.lock === 'function') {
@@ -216,7 +226,7 @@ export default function App() {
     setShowAchievements(false);
     setShowLeaderboard(false);
     setShowInitialsPrompt(false);
-    engineRef.current?.startNewGame(true, 1, 1);
+    engineRef.current?.startNewGame(true, 1, 1, mode, weapon, skin);
   };
 
   const handleInstall = async () => {

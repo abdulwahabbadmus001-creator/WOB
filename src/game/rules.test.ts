@@ -18,6 +18,11 @@ import {
   EMP_STUN_SECONDS,
   EPISODES_PER_CHAPTER,
   getUpgradeCost,
+  getDailyChallenge,
+  isShipSkinUnlocked,
+  loadShipSkin,
+  saveShipSkin,
+  SHIP_SKIN_STORAGE_KEY,
   loadHighScore,
   MAX_COMBO_MULTIPLIER,
   pickEnemyKind,
@@ -226,7 +231,7 @@ test('combo multiplier, EMP, Tactical Shield, and Polly partner constants are ba
   const second = advanceComboStreak(first.streak);
   assert.equal(second.multiplier, 2);
 
-  const capped = advanceComboStreak(14);
+  const capped = advanceComboStreak(MAX_COMBO_MULTIPLIER - 1);
   assert.equal(capped.multiplier, MAX_COMBO_MULTIPLIER);
 
   const streak5 = computeComboRewards(100, 2, 5);
@@ -238,4 +243,30 @@ test('combo multiplier, EMP, Tactical Shield, and Polly partner constants are ba
   assert.ok(TACTICAL_SHIELD_DURATION > 0 && TACTICAL_SHIELD_COOLDOWN > TACTICAL_SHIELD_DURATION);
   assert.ok(POLLY_ASSIST_DURATION > 0 && POLLY_ASSIST_COOLDOWN > POLLY_ASSIST_DURATION);
   assert.ok(POLLY_AUTO_ENEMY_THRESHOLD >= 5);
+});
+
+test('daily challenge is stable within a UTC date and rotates between challenge presets', () => {
+  const firstDay = new Date('2026-04-10T02:00:00Z');
+  const laterSameDay = new Date('2026-04-10T22:00:00Z');
+  const nextDay = new Date('2026-04-11T02:00:00Z');
+
+  assert.deepEqual(getDailyChallenge(firstDay), getDailyChallenge(laterSameDay));
+  assert.notEqual(getDailyChallenge(firstDay).id, getDailyChallenge(nextDay).id);
+  assert.ok(getDailyChallenge(firstDay).description.length > 0);
+});
+
+test('high-score milestones unlock and persist cosmetic ship skins', () => {
+  const memory = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => memory.get(key) ?? null,
+    setItem: (key: string, value: string) => memory.set(key, value),
+  };
+
+  assert.equal(isShipSkinUnlocked('violet', 4999), false);
+  assert.equal(isShipSkinUnlocked('violet', 5000), true);
+  assert.equal(isShipSkinUnlocked('gold', 19999), false);
+  saveShipSkin('violet', storage);
+  assert.equal(memory.get(SHIP_SKIN_STORAGE_KEY), 'violet');
+  assert.equal(loadShipSkin(4999, storage), 'cyan');
+  assert.equal(loadShipSkin(5000, storage), 'violet');
 });

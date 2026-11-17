@@ -34,6 +34,19 @@ test('applyAchievementDelta unlocks Chapter 2, Chapter 5, and Defeat 1000 Enemie
   assert.ok(killIds.includes('enemy_slayer_1000'));
 });
 
+test('combo, perfect-clear, and shard-hoarder milestones unlock from their progress', () => {
+  const result = applyAchievementDelta(createInitialAchievementState(), {
+    maxComboReached: 20,
+    perfectEpisodesCleared: 1,
+    shardsCollected: 500,
+  });
+  const ids = result.newlyUnlocked.map((achievement) => achievement.id);
+
+  assert.ok(ids.includes('combo_master'));
+  assert.ok(ids.includes('untouchable'));
+  assert.ok(ids.includes('shard_hoarder'));
+});
+
 test('achievement state persists cleanly to storage and handles malformed data', () => {
   const mem = new Map<string, string>();
   const mockStorage = {

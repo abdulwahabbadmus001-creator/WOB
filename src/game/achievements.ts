@@ -3,7 +3,9 @@ export type AchievementMetric =
   | 'totalShardsCollected'
   | 'highestChapter'
   | 'totalBossesDefeated'
-  | 'totalUpgradesBought';
+  | 'totalUpgradesBought'
+  | 'highestCombo'
+  | 'perfectEpisodesCleared';
 
 export interface AchievementDefinition {
   id: string;
@@ -20,6 +22,8 @@ export interface AchievementProgress {
   highestChapter: number;
   totalBossesDefeated: number;
   totalUpgradesBought: number;
+  highestCombo: number;
+  perfectEpisodesCleared: number;
 }
 
 export interface AchievementStoreState {
@@ -94,6 +98,30 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     target: 1000,
     accentColor: '#a3ff12',
   },
+  {
+    id: 'combo_master',
+    title: 'Combo Master',
+    description: 'Reach a 20x combo multiplier',
+    metric: 'highestCombo',
+    target: 20,
+    accentColor: '#ff007f',
+  },
+  {
+    id: 'untouchable',
+    title: 'Untouchable',
+    description: 'Clear an episode without taking damage',
+    metric: 'perfectEpisodesCleared',
+    target: 1,
+    accentColor: '#00f5d4',
+  },
+  {
+    id: 'shard_hoarder',
+    title: 'Shard Hoarder',
+    description: 'Collect 500 Data Shards across runs',
+    metric: 'totalShardsCollected',
+    target: 500,
+    accentColor: '#38bdf8',
+  },
 ] as const;
 
 export function createInitialAchievementState(): AchievementStoreState {
@@ -104,6 +132,8 @@ export function createInitialAchievementState(): AchievementStoreState {
       highestChapter: 1,
       totalBossesDefeated: 0,
       totalUpgradesBought: 0,
+      highestCombo: 1,
+      perfectEpisodesCleared: 0,
     },
     unlockedIds: [],
   };
@@ -115,6 +145,8 @@ export type AchievementDelta = {
   chapterReached?: number;
   bossesDefeated?: number;
   upgradesBought?: number;
+  maxComboReached?: number;
+  perfectEpisodesCleared?: number;
 };
 
 export function applyAchievementDelta(
@@ -137,6 +169,13 @@ export function applyAchievementDelta(
       current.progress.totalBossesDefeated + Math.max(0, delta.bossesDefeated ?? 0),
     totalUpgradesBought:
       current.progress.totalUpgradesBought + Math.max(0, delta.upgradesBought ?? 0),
+    highestCombo: Math.max(
+      current.progress.highestCombo,
+      Math.max(1, delta.maxComboReached ?? 1),
+    ),
+    perfectEpisodesCleared:
+      current.progress.perfectEpisodesCleared +
+      Math.max(0, delta.perfectEpisodesCleared ?? 0),
   };
 
   const unlockedSet = new Set(current.unlockedIds);
@@ -186,6 +225,8 @@ export function loadAchievementState(
         highestChapter: Math.max(1, Number(p.highestChapter ?? p.highestWave) || 1),
         totalBossesDefeated: Math.max(0, Number(p.totalBossesDefeated) || 0),
         totalUpgradesBought: Math.max(0, Number(p.totalUpgradesBought) || 0),
+        highestCombo: Math.max(1, Number(p.highestCombo) || 1),
+        perfectEpisodesCleared: Math.max(0, Number(p.perfectEpisodesCleared) || 0),
       },
       unlockedIds,
     };

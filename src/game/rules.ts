@@ -7,13 +7,125 @@ import type {
   UpgradeConfig,
   UpgradeId,
   UpgradeLevels,
+  DailyChallenge,
+  ShipSkin,
 } from './types';
 
 export const EPISODES_PER_CHAPTER = 10;
 export const BASE_EPISODE_DURATION_SECONDS = 24;
 export const HIGH_SCORE_STORAGE_KEY = 'wob_high_score_v1';
 export const COMBO_WINDOW_SECONDS = 3.2;
-export const MAX_COMBO_MULTIPLIER = 10;
+export const MAX_COMBO_MULTIPLIER = 20;
+
+const DAILY_CHALLENGES: readonly DailyChallenge[] = [
+  {
+    id: 'overclock',
+    title: 'Overclock',
+    description: 'Double-speed enemies · Half hull · EMP disabled',
+    speedMultiplier: 2,
+    healthMultiplier: 0.5,
+    enemyHealthMultiplier: 1,
+    empDisabled: true,
+  },
+  {
+    id: 'redline',
+    title: 'Redline',
+    description: 'Fast enemies · Fragile hull · EMP ready',
+    speedMultiplier: 1.6,
+    healthMultiplier: 0.65,
+    enemyHealthMultiplier: 1,
+    empDisabled: false,
+  },
+  {
+    id: 'iron-comet',
+    title: 'Iron Comet',
+    description: 'Heavy enemies · Normal speed · EMP disabled',
+    speedMultiplier: 1,
+    healthMultiplier: 1,
+    enemyHealthMultiplier: 1.5,
+    empDisabled: true,
+  },
+];
+
+export function getDailyChallenge(date = new Date()): DailyChallenge {
+  const day = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+  const dayIndex = Math.floor(day / 86_400_000);
+  const challengeIndex =
+    ((dayIndex % DAILY_CHALLENGES.length) + DAILY_CHALLENGES.length) %
+    DAILY_CHALLENGES.length;
+  return DAILY_CHALLENGES[challengeIndex];
+}
+
+export const SHIP_SKINS: readonly {
+  id: ShipSkin;
+  name: string;
+  hullColor: string;
+  trailColor: string;
+  unlockScore: number;
+}[] = [
+  {
+    id: 'cyan',
+    name: 'Neon Cyan',
+    hullColor: '#00f5d4',
+    trailColor: '#38bdf8',
+    unlockScore: 0,
+  },
+  {
+    id: 'violet',
+    name: 'Ion Violet',
+    hullColor: '#c084fc',
+    trailColor: '#818cf8',
+    unlockScore: 5000,
+  },
+  {
+    id: 'gold',
+    name: 'Solar Gold',
+    hullColor: '#fbbf24',
+    trailColor: '#fb7185',
+    unlockScore: 20000,
+  },
+];
+
+export const SHIP_SKIN_STORAGE_KEY = 'wob_ship_skin_v1';
+
+export function getShipSkinConfig(skin: ShipSkin) {
+  const config = SHIP_SKINS.find((item) => item.id === skin);
+  if (!config) throw new Error(`Unknown ship skin: ${skin}`);
+  return config;
+}
+
+export function isShipSkinUnlocked(skin: ShipSkin, highScore: number): boolean {
+  const config = SHIP_SKINS.find((item) => item.id === skin);
+  return Boolean(config && highScore >= config.unlockScore);
+}
+
+export function loadShipSkin(
+  highScore: number,
+  storage?: Pick<Storage, 'getItem'> | null,
+): ShipSkin {
+  try {
+    const target =
+      storage ?? (typeof window !== 'undefined' ? window.localStorage : null);
+    const saved = target?.getItem(SHIP_SKIN_STORAGE_KEY);
+    const skin = SHIP_SKINS.find((item) => item.id === saved)?.id ?? 'cyan';
+    return isShipSkinUnlocked(skin, highScore) ? skin : 'cyan';
+  } catch {
+    return 'cyan';
+  }
+}
+
+export function saveShipSkin(
+  skin: ShipSkin,
+  storage?: Pick<Storage, 'setItem'> | null,
+): void {
+  try {
+    const target =
+      storage ?? (typeof window !== 'undefined' ? window.localStorage : null);
+    target?.setItem(SHIP_SKIN_STORAGE_KEY, skin);
+  } catch {
+    // Ignore storage quota or private-mode errors
+  }
+}
 
 // EMP Emergency Bomb
 export const EMP_COOLDOWN_SECONDS = 30;

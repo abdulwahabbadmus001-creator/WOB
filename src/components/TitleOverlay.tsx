@@ -1,11 +1,19 @@
-import React from 'react';
+import React, { useState } from 'react';
+import {
+  getDailyChallenge,
+  isShipSkinUnlocked,
+  loadShipSkin,
+  saveShipSkin,
+  SHIP_SKINS,
+} from '../game/rules';
+import type { GameMode, ShipSkin, WeaponType } from '../game/types';
 
 interface TitleOverlayProps {
   highScore: number;
   muted: boolean;
   unlockedCount: number;
   totalAchievements: number;
-  onStart: () => void;
+  onStart: (mode: GameMode, weapon: WeaponType, skin: ShipSkin) => void;
   onToggleMute: () => void;
   onInstall?: () => void;
   installHelp?: boolean;
@@ -25,6 +33,11 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
   onOpenLeaderboard,
   onOpenAchievements,
 }) => {
+  const [selectedMode, setSelectedMode] = useState<GameMode>('campaign');
+  const [selectedWeapon, setSelectedWeapon] = useState<WeaponType>('spread');
+  const [selectedSkin, setSelectedSkin] = useState<ShipSkin>(() => loadShipSkin(highScore));
+  const dailyChallenge = getDailyChallenge();
+
   return (
     <div className="absolute inset-0 z-20 flex flex-col justify-between p-5 sm:p-8 md:p-12 [@media(max-height:500px)]:p-3.5 pointer-events-none">
       {/* Top minimal utility corner */}
@@ -150,8 +163,10 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
         </div>
 
         <p className="text-sm [@media(max-height:500px)]:text-xs text-slate-300 mb-4 [@media(max-height:500px)]:mb-2.5 max-w-md leading-relaxed [@media(max-height:500px)]:leading-snug">
-          Pilot <span className="text-[#00f5d4] font-semibold">Tommy</span> across endless 10-Episode Chapters alongside wingman{' '}
-          <span className="text-[#a3ff12] font-semibold">Polly</span>. Survive Episodes 1–9, deflect fire with your Tactical Shield, and defeat each Chapter&apos;s Gigantic Episode 10 Boss.
+          Pilot <span className="text-[#00f5d4] font-semibold">Tommy</span>{' '}
+          alongside wingman{' '}
+          <span className="text-[#a3ff12] font-semibold">Polly</span>. Survive the
+          campaign, take on endless waves, or try today&apos;s challenge.
         </p>
 
         {highScore > 0 && (
@@ -164,17 +179,76 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
           </div>
         )}
 
+        <div className="flex flex-wrap items-center gap-2.5 sm:gap-3 mb-2">
+          <label className="pointer-events-auto flex flex-col gap-1 text-[10px] uppercase tracking-wider text-slate-400">
+            Run mode
+            <select
+              aria-label="Run mode"
+              value={selectedMode}
+              onChange={(event) => setSelectedMode(event.target.value as GameMode)}
+              className="rounded-lg border border-slate-700 bg-[#0f172a] px-3 py-2.5 text-xs font-semibold text-slate-100 outline-none focus:border-[#00f5d4]"
+            >
+              <option value="campaign">Campaign</option>
+              <option value="survival">Endless Survival</option>
+              <option value="daily">Daily Challenge · {dailyChallenge.title}</option>
+            </select>
+          </label>
+          <label className="pointer-events-auto flex flex-col gap-1 text-[10px] uppercase tracking-wider text-slate-400">
+            Weapon loadout
+            <select
+              aria-label="Weapon loadout"
+              value={selectedWeapon}
+              onChange={(event) => setSelectedWeapon(event.target.value as WeaponType)}
+              className="rounded-lg border border-slate-700 bg-[#0f172a] px-3 py-2.5 text-xs font-semibold text-slate-100 outline-none focus:border-[#00f5d4]"
+            >
+              <option value="spread">Spread Shot</option>
+              <option value="laser">Laser Beam</option>
+              <option value="homing">Homing Missiles</option>
+              <option value="plasma">Plasma Burst</option>
+            </select>
+          </label>
+          <label className="pointer-events-auto flex flex-col gap-1 text-[10px] uppercase tracking-wider text-slate-400">
+            Ship skin
+            <select
+              aria-label="Ship skin"
+              value={selectedSkin}
+              onChange={(event) => {
+                const skin = event.target.value as ShipSkin;
+                setSelectedSkin(skin);
+                saveShipSkin(skin);
+              }}
+              className="rounded-lg border border-slate-700 bg-[#0f172a] px-3 py-2.5 text-xs font-semibold text-slate-100 outline-none focus:border-[#00f5d4]"
+            >
+              {SHIP_SKINS.map((skin) => {
+                const unlocked = isShipSkinUnlocked(skin.id, highScore);
+                return (
+                  <option key={skin.id} value={skin.id} disabled={!unlocked}>
+                    {unlocked
+                      ? skin.name
+                      : `${skin.name} · ${skin.unlockScore.toLocaleString()} score`}
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+        </div>
+        {selectedMode === 'daily' && (
+          <p className="mb-3 text-xs font-mono-num text-[#a3ff12]">
+            Today: {dailyChallenge.description}
+          </p>
+        )}
+
         <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
           <button
             type="button"
             data-start="true"
             onClick={(e) => {
               e.currentTarget.blur();
-              onStart();
+              onStart(selectedMode, selectedWeapon, selectedSkin);
             }}
             className="pointer-events-auto px-7 py-3.5 [@media(max-height:500px)]:px-5 [@media(max-height:500px)]:py-2.5 text-base [@media(max-height:500px)]:text-sm font-display font-bold tracking-wider uppercase text-[#0b0f19] bg-[#00f5d4] rounded-lg shadow-[0_0_24px_rgba(0,245,212,0.4)] hover:bg-[#38ffe5] active:scale-[0.98] transition-all duration-150 cursor-pointer whitespace-nowrap"
           >
-            Start Campaign
+            Start {selectedMode === 'campaign' ? 'Campaign' : selectedMode === 'daily' ? 'Daily Run' : 'Survival'}
           </button>
 
           <button

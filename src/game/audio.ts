@@ -150,7 +150,7 @@ class RetroAudioEngine {
     sub.stop(now + duration);
   }
 
-  public playPickup(): void {
+  public playPickup(comboMultiplier = 1): void {
     if (this.muted) return;
     const ctx = this.ensureContext();
     if (!ctx) return;
@@ -166,7 +166,7 @@ class RetroAudioEngine {
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.type = 'sine';
-    const base = 560 + this.pickupCombo * 55;
+    const base = 560 + this.pickupCombo * 35 + Math.max(0, comboMultiplier - 1) * 28;
     osc.frequency.setValueAtTime(this.pitchJitter(base, 0.03), now);
     osc.frequency.exponentialRampToValueAtTime(base * 1.45, now + 0.09);
 

@@ -6,7 +6,19 @@ export type GameState =
   | 'chapter_victory'
   | 'gameover';
 
-export type GameMode = 'campaign' | 'classic' | 'boss_rush';
+export type GameMode = 'campaign' | 'survival' | 'daily';
+export type WeaponType = 'spread' | 'laser' | 'homing' | 'plasma';
+export type ShipSkin = 'cyan' | 'violet' | 'gold';
+
+export interface DailyChallenge {
+  id: string;
+  title: string;
+  description: string;
+  speedMultiplier: number;
+  healthMultiplier: number;
+  enemyHealthMultiplier: number;
+  empDisabled: boolean;
+}
 
 export type BossArchetype = 'sentinel' | 'helix' | 'architect' | 'leviathan';
 
@@ -48,6 +60,9 @@ export type EnemyKind = 'block' | 'firewall' | 'interceptor' | 'boss';
 
 export interface HudSnapshot {
   mode: GameMode;
+  dailyChallengeTitle: string;
+  dailyChallengeDescription: string;
+  empDisabled: boolean;
   score: number;
   highScore: number;
   hp: number;

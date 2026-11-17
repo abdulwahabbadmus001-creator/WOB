@@ -27,6 +27,8 @@ import {
   computePlayerStats,
   createChapterStarterUpgrades,
   createInitialUpgrades,
+  getDailyChallenge,
+  getShipSkinConfig,
   EMP_BLAST_DAMAGE,
   EMP_BLAST_RADIUS,
   EMP_COOLDOWN_SECONDS,
@@ -54,6 +56,8 @@ import type {
   RunSummary,
   UpgradeId,
   UpgradeLevels,
+  ShipSkin,
+  WeaponType,
 } from './types';
 
 interface Bullet {
@@ -109,6 +113,9 @@ interface Enemy {
   droneCount?: number;
   aggressionRate?: number;
   isBossMinion?: boolean;
+  shielded?: boolean;
+  shieldOpenTimer?: number;
+  bossPhase?: number;
 }
 
 interface EnergyOrb {
@@ -155,6 +162,17 @@ interface Afterimage {
   maxLife: number;
 }
 
+interface AsteroidHazard {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  radius: number;
+  angle: number;
+  spin: number;
+  life: number;
+}
+
 export interface EngineCallbacks {
   onStateChange: (state: GameState) => void;
   onHudUpdate: (hud: HudSnapshot) => void;
@@ -192,6 +210,7 @@ export class WobGameEngine {
   private hudSyncTimer = 0;
   private deathDelayTimer = 0;
   private isDyingSequence = false;
+  private episodeDamaged = false;
 
   // Tommy (Player Core) state
   private playerX = 640;
@@ -235,6 +254,10 @@ export class WobGameEngine {
 
   // Endless Chapter & Episode Campaign Progression
   private mode: GameMode = 'campaign';
+  private selectedWeapon: WeaponType = 'spread';
+  private selectedShipSkin: ShipSkin = 'cyan';
+  private dailyChallenge = getDailyChallenge();
+  private survivalWaveTimer = 40;
   private score = 0;
   private highScore = 0;
   private initialHighScore = 0;
@@ -275,6 +298,7 @@ export class WobGameEngine {
   private nextEnemyId = 1;
   private enemySpawnTimer = 1.5;
   private ambientOrbTimer = 4.0;
+  private hazardTimer = 7;
   private bossBannerTimer = 0;
   private bossBannerText = '';
   private pollyBannerTimer = 0;
@@ -299,6 +323,7 @@ export class WobGameEngine {
   private labelCursor = 0;
   private afterimages: Afterimage[] = [];
   private afterimageCursor = 0;
+  private hazards: AsteroidHazard[] = [];
 
   private bgMotes: Array<{
     x: number;
@@ -492,6 +517,8 @@ export class WobGameEngine {
         target &&
         (target.tagName === 'INPUT' ||
           target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.tagName === 'BUTTON' ||
           target.isContentEditable)
       ) {
         return;
@@ -741,6 +768,9 @@ export class WobGameEngine {
     fromUserGesture = false,
     startChapter = this.configuredStartChapter,
     startEpisode = this.configuredStartEpisode,
+    mode: GameMode = 'campaign',
+    weapon: WeaponType = 'spread',
+    skin: ShipSkin = 'cyan',
   ): void {
     if (fromUserGesture) {
       soundFX.unlock();
@@ -751,6 +781,11 @@ export class WobGameEngine {
     this.keysHeld.clear();
     this.pointerActive = false;
 
+    this.mode = mode;
+    this.selectedWeapon = weapon;
+    this.selectedShipSkin = skin;
+    this.dailyChallenge = getDailyChallenge();
+    this.survivalWaveTimer = 40;
     this.chapter = Math.max(1, startChapter);
     this.episode = Math.max(1, Math.min(EPISODES_PER_CHAPTER, startEpisode));
     this.chaptersCleared = Math.max(0, this.chapter - 1);
@@ -768,7 +803,13 @@ export class WobGameEngine {
     this.playerHp =
       this.configuredStartHp !== null
         ? Math.min(stats.maxHp, this.configuredStartHp)
-        : stats.maxHp;
+        : Math.max(
+            1,
+            Math.round(
+              stats.maxHp *
+                (mode === 'daily' ? this.dailyChallenge.healthMultiplier : 1),
+            ),
+          );
     this.playerShield = this.configuredStartHp !== null ? 0 : stats.maxShield;
     this.shieldRegenTimer = 0;
     this.playerInvuln = 1.2;
@@ -792,6 +833,7 @@ export class WobGameEngine {
     this.pollyFireTimer = 0;
     this.pollyBeamFlashTimer = 0;
     this.bossFightElapsed = 0;
+    this.episodeDamaged = false;
 
     this.score = 0;
     this.highScore = loadHighScore();
@@ -842,9 +884,12 @@ export class WobGameEngine {
     this.episodeTimeRemaining = epCfg.durationSeconds;
     this.enemySpawnTimer = 0.9;
     this.ambientOrbTimer = 2.6;
+    this.hazardTimer = 7;
+    this.hazards = [];
     this.bossBannerTimer = 0;
     this.pollyBannerTimer = 0;
     this.bossFightElapsed = 0;
+    this.episodeDamaged = false;
 
     this.enemies = [];
     for (const b of this.bullets) b.active = false;
@@ -1040,7 +1085,13 @@ export class WobGameEngine {
     }
 
     const epCfg = computeEpisodeConfig(this.chapter, this.episode);
-    const bossHp = Math.round(340 * epCfg.hpMultiplier + this.episode * 75);
+    const dailyEnemyHealth =
+      this.mode === 'daily' ? this.dailyChallenge.enemyHealthMultiplier : 1;
+    const dailyEnemySpeed =
+      this.mode === 'daily' ? this.dailyChallenge.speedMultiplier : 1;
+    const bossHp = Math.round(
+      (340 * epCfg.hpMultiplier + this.episode * 75) * dailyEnemyHealth,
+    );
 
     this.enemies.push({
       id: this.nextEnemyId++,
@@ -1053,7 +1104,7 @@ export class WobGameEngine {
       radius: 34,
       hp: bossHp,
       maxHp: bossHp,
-      speed: 82 * (1 + (this.chapter - 1) * 0.14),
+      speed: 82 * (1 + (this.chapter - 1) * 0.14) * dailyEnemySpeed,
       damage: 24,
       scoreValue: 550 + this.chapter * 180,
       shardValue: 9 + this.chapter * 2,
@@ -1117,6 +1168,7 @@ export class WobGameEngine {
       spiralSpokes: cfg.spiralSpokes,
       droneCount: cfg.droneCount,
       aggressionRate: cfg.aggressionRate,
+      bossPhase: 0,
     });
 
     this.bossBannerTimer = 3.2;
@@ -1274,36 +1326,67 @@ export class WobGameEngine {
       this.episode,
       this.configuredEpisodeDuration,
     );
+    const endlessMode = this.mode !== 'campaign';
 
-    if (!epCfg.isBossEpisode) {
+    if (endlessMode) {
+      this.survivalWaveTimer -= dt;
+      if (this.survivalWaveTimer <= 0) {
+        this.survivalWaveTimer = 40;
+        this.episode += 1;
+        if (this.episode > EPISODES_PER_CHAPTER) {
+          this.chapter += 1;
+          this.episode = 1;
+        }
+        if (this.episode % 5 === 0) {
+          this.spawnSubBoss();
+          this.spawnLabel(this.width / 2, 60, `SURVIVAL WAVE ${this.episode}`, '#ff007f');
+        }
+      }
+    } else if (!epCfg.isBossEpisode) {
       this.episodeTimeRemaining -= dt;
       if (this.episodeTimeRemaining <= 0) {
         this.episodeTimeRemaining = 0;
         this.triggerEpisodeClear();
         return;
       }
-    } else {
+    } else if (!endlessMode) {
       this.bossFightElapsed += dt;
     }
 
     // Update Tommy
     this.updatePlayer(dt, stats);
+    this.updateHazards(dt);
 
     // Auto-fire Tommy's lasers
     this.fireTimer -= dt;
     if (this.fireTimer <= 0) {
       this.firePlayerLasers(stats);
-      this.fireTimer = stats.fireInterval;
+      this.fireTimer =
+        stats.fireInterval *
+        (this.selectedWeapon === 'plasma'
+          ? 1.65
+          : this.selectedWeapon === 'laser'
+            ? 0.8
+            : 1);
     }
 
     // Spawn tactical skirmish enemies in Episodes 1-9
-    if (!epCfg.isBossEpisode) {
+    if (endlessMode || !epCfg.isBossEpisode) {
       this.enemySpawnTimer -= dt;
       if (
         this.enemySpawnTimer <= 0 &&
         this.enemies.length < epCfg.maxActiveEnemies
       ) {
-        this.spawnEpisodeEnemy(epCfg);
+        const spawnConfig = {
+          ...epCfg,
+          speedMultiplier:
+            epCfg.speedMultiplier *
+            (this.mode === 'daily' ? this.dailyChallenge.speedMultiplier : 1),
+          hpMultiplier:
+            epCfg.hpMultiplier *
+            (this.mode === 'daily' ? this.dailyChallenge.enemyHealthMultiplier : 1),
+        };
+        this.spawnEpisodeEnemy(spawnConfig);
         this.enemySpawnTimer = epCfg.spawnInterval * (0.85 + Math.random() * 0.3);
       }
     }
@@ -1311,7 +1394,7 @@ export class WobGameEngine {
     // Ambient Data Shards
     this.ambientOrbTimer -= dt;
     if (this.ambientOrbTimer <= 0) {
-      this.ambientOrbTimer = epCfg.isBossEpisode ? 6.0 : 5.0;
+      this.ambientOrbTimer = !endlessMode && epCfg.isBossEpisode ? 6.0 : 5.0;
       const margin = 70;
       const ox = margin + Math.random() * Math.max(40, this.width - margin * 2);
       const oy = margin + Math.random() * Math.max(40, this.height - margin * 2);
@@ -1319,9 +1402,13 @@ export class WobGameEngine {
     }
 
     // Polly Partner Assist auto-trigger & combat update
-    this.updatePollyPartner(dt, epCfg.isBossEpisode);
+    this.updatePollyPartner(dt, !endlessMode && epCfg.isBossEpisode);
 
-    this.updateEnemies(dt, epCfg.speedMultiplier);
+    this.updateEnemies(
+      dt,
+      epCfg.speedMultiplier *
+        (this.mode === 'daily' ? this.dailyChallenge.speedMultiplier : 1),
+    );
     this.updateBullets(dt);
     this.updateOrbs(dt, stats);
 
@@ -1379,6 +1466,10 @@ export class WobGameEngine {
         this.pollyBeamFlashTimer = 0.09;
         target.hp -= 10;
         target.hitFlash = 0.08;
+        if (target.shielded && (target.shieldOpenTimer ?? 0) <= 0) {
+          target.shieldOpenTimer = 2.4;
+          this.spawnLabel(target.x, target.y - target.radius, 'SHIELD BROKEN', '#38bdf8');
+        }
         this.emitParticles(target.x, target.y, '#a3ff12', 5, 160, 0.2, false);
         if (target.hp <= 0) {
           this.handleEnemyKilled(target);
@@ -1559,8 +1650,23 @@ export class WobGameEngine {
     }
 
     const count = stats.shotCount;
-    const spreadStep = 0.11;
-    const speed = 760;
+    const spreadStep = this.selectedWeapon === 'spread' ? 0.11 : 0.035;
+    const speed =
+      this.selectedWeapon === 'plasma'
+        ? 520
+        : this.selectedWeapon === 'homing'
+          ? 560
+          : 760;
+    const damage =
+      this.selectedWeapon === 'plasma'
+        ? 34
+        : this.selectedWeapon === 'laser'
+          ? 24
+          : this.selectedWeapon === 'homing'
+            ? 15
+            : 18;
+    const radius = this.selectedWeapon === 'plasma' ? 6 : this.selectedWeapon === 'laser' ? 3 : 4.2;
+    const life = this.selectedWeapon === 'plasma' ? 2 : 1.4;
     const perpX = -Math.sin(aimAngle);
     const perpY = Math.cos(aimAngle);
 
@@ -1578,11 +1684,16 @@ export class WobGameEngine {
         spawnY,
         Math.cos(angle) * speed,
         Math.sin(angle) * speed,
-        4.2,
-        18,
-        1.4,
+        radius,
+        damage,
+        life,
         false,
-        i % 2 === 1 && count > 2 ? '#a3ff12' : '#00f5d4',
+        this.selectedWeapon === 'plasma'
+          ? '#ff6b35'
+          : i % 2 === 1 && count > 2
+            ? '#a3ff12'
+            : '#00f5d4',
+        this.selectedWeapon === 'homing',
       );
     }
 
@@ -1665,6 +1776,9 @@ export class WobGameEngine {
         aimAngle: 0,
         glitchTimer: 0,
         orbitDir: Math.random() < 0.5 ? 1 : -1,
+        shielded:
+          (diff.chapter > 1 || diff.episode >= 4) && Math.random() < 0.32,
+        shieldOpenTimer: 0,
       });
     } else {
       const hp = Math.round(34 * diff.hpMultiplier);
@@ -1695,6 +1809,74 @@ export class WobGameEngine {
     }
   }
 
+  private updateHazards(dt: number): void {
+    this.hazardTimer -= dt;
+    if (this.hazardTimer <= 0) {
+      this.hazardTimer = Math.max(5.5, 11 - Math.min(4, this.chapter * 0.35));
+      if (this.hazards.length < 4) {
+        const edge = Math.floor(Math.random() * 4);
+        const pad = 30;
+        const x =
+          edge === 1
+            ? this.width + pad
+            : edge === 3
+              ? -pad
+              : Math.random() * this.width;
+        const y =
+          edge === 0
+            ? -pad
+            : edge === 2
+              ? this.height + pad
+              : Math.random() * this.height;
+        const angle =
+          Math.atan2(this.height / 2 - y, this.width / 2 - x) +
+          (Math.random() - 0.5) * 0.9;
+        const speed = 75 + Math.min(70, this.chapter * 8);
+        this.hazards.push({
+          x,
+          y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          radius: 22 + Math.random() * 15,
+          angle: Math.random() * Math.PI * 2,
+          spin: (Math.random() < 0.5 ? -1 : 1) * (0.35 + Math.random() * 0.5),
+          life: 15,
+        });
+      }
+    }
+
+    for (let i = this.hazards.length - 1; i >= 0; i--) {
+      const hazard = this.hazards[i];
+      hazard.x += hazard.vx * dt;
+      hazard.y += hazard.vy * dt;
+      hazard.angle += hazard.spin * dt;
+      hazard.life -= dt;
+      if (
+        hazard.life <= 0 ||
+        hazard.x < -hazard.radius - 40 ||
+        hazard.x > this.width + hazard.radius + 40 ||
+        hazard.y < -hazard.radius - 40 ||
+        hazard.y > this.height + hazard.radius + 40
+      ) {
+        this.hazards.splice(i, 1);
+        continue;
+      }
+      if (
+        this.playerInvuln <= 0 &&
+        circleIntersects(
+          this.playerX,
+          this.playerY,
+          this.playerRadius,
+          hazard.x,
+          hazard.y,
+          hazard.radius * 0.72,
+        )
+      ) {
+        this.damagePlayer(18, hazard.x, hazard.y, 'ASTEROID IMPACT');
+      }
+    }
+  }
+
   private countActiveTelegraphs(): number {
     let count = 0;
     for (const e of this.enemies) {
@@ -1707,6 +1889,7 @@ export class WobGameEngine {
     for (let i = this.enemies.length - 1; i >= 0; i--) {
       const e = this.enemies[i];
       e.hitFlash = Math.max(0, e.hitFlash - dt);
+      e.shieldOpenTimer = Math.max(0, (e.shieldOpenTimer ?? 0) - dt);
 
       if (e.dyingTimer > 0) {
         e.dyingTimer -= dt;
@@ -1839,7 +2022,16 @@ export class WobGameEngine {
         e.angle += dt * 0.95;
         const archetype = e.bossArchetype;
         const bossBulletMult = e.bulletSpeedMult ?? speedMult;
-        const aggro = e.aggressionRate ?? 1;
+        const phase =
+          e.hp <= e.maxHp / 3 ? 2 : e.hp <= (e.maxHp * 2) / 3 ? 1 : 0;
+        const aggro = (e.aggressionRate ?? 1) * (1 + phase * 0.18);
+        if (phase > (e.bossPhase ?? 0)) {
+          e.bossPhase = phase;
+          this.addTrauma(0.22);
+          this.emitParticles(e.x, e.y, '#a3ff12', 20, 220, 0.4, true);
+          this.spawnLabel(e.x, e.y - e.radius - 18, `PHASE ${phase + 1}`, '#a3ff12');
+          soundFX.playBossAlert();
+        }
 
         if (!archetype) {
           // Sub-boss Gatekeeper
@@ -2246,9 +2438,24 @@ export class WobGameEngine {
           if (e.dyingTimer > 0) continue;
           if (circleIntersects(b.x, b.y, b.radius, e.x, e.y, e.radius)) {
             b.active = false;
-            e.hp -= b.damage;
+            if (e.shielded && (e.shieldOpenTimer ?? 0) <= 0) {
+              this.emitParticles(b.x, b.y, '#38bdf8', 3, 90, 0.16, false);
+              break;
+            }
+            const damageAngle = Math.atan2(b.y - e.y, b.x - e.x) - e.angle;
+            const weakPointDiff = Math.atan2(
+              Math.sin(damageAngle + Math.PI / 2),
+              Math.cos(damageAngle + Math.PI / 2),
+            );
+            const weakPointHit =
+              e.isChapterBoss && Math.abs(weakPointDiff) <= 0.42;
+            e.hp -= b.damage * (weakPointHit ? 2.5 : 1);
             e.hitFlash = 0.065;
             this.emitParticles(b.x, b.y, b.color, 4, 140, 0.22, false);
+            if (weakPointHit) {
+              this.emitParticles(b.x, b.y, '#a3ff12', 8, 180, 0.25, true);
+              this.spawnLabel(e.x, e.y - e.radius - 8, 'WEAK POINT', '#a3ff12');
+            }
 
             if (e.hp <= 0) {
               this.handleEnemyKilled(e);
@@ -2272,6 +2479,7 @@ export class WobGameEngine {
     this.comboCount = streakNext.streak;
     this.comboMultiplier = streakNext.multiplier;
     this.maxCombo = Math.max(this.maxCombo, this.comboMultiplier);
+    this.recordAchievementProgress({ maxComboReached: this.maxCombo });
     this.comboTimer = streakNext.timer;
 
     const rewards = computeComboRewards(
@@ -2366,7 +2574,8 @@ export class WobGameEngine {
     if (
       this.gameState !== 'playing' ||
       this.isDyingSequence ||
-      this.empCooldownTimer > 0
+      this.empCooldownTimer > 0 ||
+      (this.mode === 'daily' && this.dailyChallenge.empDisabled)
     ) {
       return false;
     }
@@ -2401,6 +2610,10 @@ export class WobGameEngine {
         e.stunTimer = EMP_STUN_SECONDS;
         e.state = 'approach';
         e.stateTimer = 1.2;
+      }
+      if (e.shielded) {
+        e.shieldOpenTimer = Math.max(e.shieldOpenTimer ?? 0, EMP_STUN_SECONDS + 1.2);
+        this.spawnLabel(e.x, e.y - e.radius, 'SHIELD BROKEN', '#38bdf8');
       }
 
       const dist = Math.hypot(e.x - this.playerX, e.y - this.playerY);
@@ -2439,6 +2652,7 @@ export class WobGameEngine {
     this.comboTimer = 0;
 
     const res = applyIncomingDamage(this.playerHp, this.playerShield, amount);
+    this.episodeDamaged = true;
     this.playerHp = res.hp;
     this.playerShield = res.shield;
     this.shieldRegenTimer = computePlayerStats(this.upgrades).shieldRegenDelay;
@@ -2510,6 +2724,9 @@ export class WobGameEngine {
   }
 
   private triggerEpisodeClear(): void {
+    if (!this.episodeDamaged) {
+      this.recordAchievementProgress({ perfectEpisodesCleared: 1 });
+    }
     soundFX.playWaveClear();
     this.keysHeld.clear();
     this.pointerActive = false;
@@ -2557,7 +2774,7 @@ export class WobGameEngine {
         if (this.score > this.highScore) {
           this.highScore = saveHighScore(this.score);
         }
-        soundFX.playPickup();
+        soundFX.playPickup(this.comboMultiplier);
         this.emitParticles(orb.x, orb.y, '#38bdf8', 6, 130, 0.25, false);
         this.spawnLabel(orb.x, orb.y - 10, `+${orb.value} SHARD`, '#38bdf8');
         this.recordAchievementProgress({ shardsCollected: orb.value });
@@ -2715,6 +2932,10 @@ export class WobGameEngine {
 
     this.callbacks.onHudUpdate({
       mode: this.mode,
+      dailyChallengeTitle: this.mode === 'daily' ? this.dailyChallenge.title : '',
+      dailyChallengeDescription:
+        this.mode === 'daily' ? this.dailyChallenge.description : '',
+      empDisabled: this.mode === 'daily' && this.dailyChallenge.empDisabled,
       score: Math.round(this.score),
       highScore: Math.round(this.highScore),
       hp: Math.round(this.playerHp),
@@ -2726,7 +2947,8 @@ export class WobGameEngine {
       episodesPerChapter: EPISODES_PER_CHAPTER,
       episodeTimeRemaining: Math.max(0, Math.ceil(this.episodeTimeRemaining)),
       episodeDuration: this.episodeDuration,
-      isBossEpisode: this.episode === EPISODES_PER_CHAPTER,
+      isBossEpisode:
+        this.mode === 'campaign' && this.episode === EPISODES_PER_CHAPTER,
       shards: this.shards,
       totalShardsCollected: this.totalShardsCollected,
       enemiesDefeated: this.enemiesDefeated,
@@ -2811,6 +3033,7 @@ export class WobGameEngine {
     }
 
     this.renderOrbs(ctx);
+    this.renderHazards(ctx);
     this.renderAfterimages(ctx);
     this.renderEnemies(ctx);
     this.renderBullets(ctx);
@@ -2907,7 +3130,18 @@ export class WobGameEngine {
     const offsetY = ((parallaxY % gridSize) + gridSize) % gridSize;
 
     ctx.save();
-    ctx.strokeStyle = 'rgba(30, 58, 95, 0.28)';
+    const comboColor =
+      this.comboMultiplier >= 8
+        ? '255, 0, 127'
+        : this.comboMultiplier >= 5
+          ? '0, 245, 212'
+          : this.comboMultiplier >= 2
+            ? '163, 255, 18'
+            : '30, 58, 95';
+    const comboPulse = this.comboMultiplier > 1
+      ? 0.28 + Math.sin(this.titleTime * (2 + this.comboMultiplier * 0.45)) * 0.08
+      : 0.28;
+    ctx.strokeStyle = `rgba(${comboColor}, ${comboPulse})`;
     ctx.lineWidth = 1;
     ctx.beginPath();
     for (let x = offsetX; x < this.width; x += gridSize) {
@@ -2920,7 +3154,7 @@ export class WobGameEngine {
     }
     ctx.stroke();
 
-    ctx.fillStyle = 'rgba(0, 245, 212, 0.14)';
+    ctx.fillStyle = `rgba(${comboColor}, ${this.comboMultiplier > 1 ? 0.1 + comboPulse * 0.3 : 0.14})`;
     for (let x = offsetX; x < this.width; x += gridSize * 2) {
       for (let y = offsetY; y < this.height; y += gridSize * 2) {
         ctx.fillRect(x - 1, y - 1, 2, 2);
@@ -2937,6 +3171,28 @@ export class WobGameEngine {
       ctx.fillRect(m.x, m.y, m.size, m.size);
     }
     ctx.restore();
+  }
+
+  private renderHazards(ctx: CanvasRenderingContext2D): void {
+    for (const hazard of this.hazards) {
+      ctx.save();
+      ctx.translate(hazard.x, hazard.y);
+      ctx.rotate(hazard.angle);
+      ctx.fillStyle = 'rgba(255, 107, 53, 0.14)';
+      ctx.strokeStyle = 'rgba(255, 107, 53, 0.82)';
+      ctx.lineWidth = 2;
+      this.drawPolygon(ctx, 0, 0, hazard.radius, 8);
+      ctx.fill();
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(255, 190, 130, 0.55)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(-hazard.radius * 0.45, -hazard.radius * 0.15);
+      ctx.lineTo(hazard.radius * 0.28, hazard.radius * 0.22);
+      ctx.lineTo(hazard.radius * 0.05, hazard.radius * 0.58);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   private renderTitleHeroCore(ctx: CanvasRenderingContext2D): void {
@@ -3091,7 +3347,8 @@ export class WobGameEngine {
   }
 
   private drawPollyGeometry(ctx: CanvasRenderingContext2D): void {
-    ctx.strokeStyle = 'rgba(163, 255, 18, 0.35)';
+    const colors = getShipSkinConfig(this.selectedShipSkin);
+    ctx.strokeStyle = `${colors.hullColor}59`;
     ctx.lineWidth = 5;
     ctx.beginPath();
     ctx.moveTo(14, 0);
@@ -3102,12 +3359,12 @@ export class WobGameEngine {
     ctx.stroke();
 
     ctx.fillStyle = '#0f172a';
-    ctx.strokeStyle = '#a3ff12';
+    ctx.strokeStyle = colors.hullColor;
     ctx.lineWidth = 2;
     ctx.fill();
     ctx.stroke();
 
-    ctx.fillStyle = '#38bdf8';
+    ctx.fillStyle = colors.trailColor;
     ctx.beginPath();
     ctx.arc(2, 0, 3.2, 0, Math.PI * 2);
     ctx.fill();
@@ -3117,8 +3374,9 @@ export class WobGameEngine {
     ctx: CanvasRenderingContext2D,
     isHitFlash: boolean,
   ): void {
+    const colors = getShipSkinConfig(this.selectedShipSkin);
     const flameLen = 10 + Math.sin(this.titleTime * 40) * 3;
-    ctx.fillStyle = 'rgba(56, 189, 248, 0.35)';
+    ctx.fillStyle = `${colors.trailColor}59`;
     ctx.beginPath();
     ctx.moveTo(-10, -6);
     ctx.lineTo(-14 - flameLen, 0);
@@ -3126,7 +3384,7 @@ export class WobGameEngine {
     ctx.closePath();
     ctx.fill();
 
-    ctx.fillStyle = '#38bdf8';
+    ctx.fillStyle = colors.trailColor;
     ctx.beginPath();
     ctx.moveTo(-10, -3.5);
     ctx.lineTo(-10 - flameLen, 0);
@@ -3141,17 +3399,17 @@ export class WobGameEngine {
     ctx.lineTo(-10, 13);
     ctx.closePath();
 
-    ctx.strokeStyle = isHitFlash ? 'rgba(255,255,255,0.45)' : 'rgba(0, 245, 212, 0.28)';
+    ctx.strokeStyle = isHitFlash ? 'rgba(255,255,255,0.45)' : `${colors.hullColor}47`;
     ctx.lineWidth = 7;
     ctx.stroke();
 
     ctx.fillStyle = isHitFlash ? '#ffffff' : '#0f172a';
-    ctx.strokeStyle = isHitFlash ? '#ffffff' : '#00f5d4';
+    ctx.strokeStyle = isHitFlash ? '#ffffff' : colors.hullColor;
     ctx.lineWidth = 2.2;
     ctx.fill();
     ctx.stroke();
 
-    ctx.fillStyle = isHitFlash ? '#ffffff' : '#a3ff12';
+    ctx.fillStyle = isHitFlash ? '#ffffff' : colors.trailColor;
     ctx.beginPath();
     ctx.arc(2, 0, 4.2, 0, Math.PI * 2);
     ctx.fill();
@@ -3200,6 +3458,18 @@ export class WobGameEngine {
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
         ctx.arc(0, 0, e.radius + 7, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      if (!isDying && e.shielded && (e.shieldOpenTimer ?? 0) <= 0) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.88)';
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.12)';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.arc(0, 0, e.radius + 6, 0, Math.PI * 2);
+        ctx.fill();
         ctx.stroke();
         ctx.restore();
       }
@@ -3355,6 +3625,20 @@ export class WobGameEngine {
         ctx.beginPath();
         ctx.arc(0, 0, e.isChapterBoss ? 11 : 9, 0, Math.PI * 2);
         ctx.fill();
+
+        if (e.isChapterBoss && !isDying) {
+          ctx.save();
+          ctx.rotate(e.angle * 2);
+          ctx.translate(0, -e.radius * 0.68);
+          const pulse = 0.78 + Math.sin(this.titleTime * 9) * 0.22;
+          ctx.globalAlpha = pulse;
+          ctx.fillStyle = '#a3ff12';
+          ctx.shadowColor = '#a3ff12';
+          ctx.shadowBlur = 12;
+          this.drawPolygon(ctx, 0, 0, 6, 4);
+          ctx.fill();
+          ctx.restore();
+        }
       }
 
       ctx.restore();

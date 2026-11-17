@@ -51,6 +51,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   const formattedTimer = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 
   const empReady = hud.empCooldownRemaining <= 0;
+  const empAvailable = empReady && !hud.empDisabled;
   const empChargePct = empReady
     ? 100
     : Math.max(
@@ -226,7 +227,11 @@ export const GameHud: React.FC<GameHudProps> = ({
           <div className="flex items-center gap-2.5 sm:gap-4 [@media(max-height:500px)]:gap-2 bg-[#0b0f19]/88 border border-[#1e293b] rounded-lg px-3 py-1.5 sm:px-4 sm:py-2 [@media(max-height:500px)]:px-2.5 [@media(max-height:500px)]:py-1 shadow-[0_4px_20px_rgba(0,0,0,0.55)]">
             <div className="flex flex-col items-center">
               <span className="text-[9px] sm:text-[10px] [@media(max-height:500px)]:text-[8px] uppercase tracking-widest text-slate-400">
-                WOB · Chapter
+                {hud.mode === 'campaign'
+                  ? 'WOB · Chapter'
+                  : hud.mode === 'daily'
+                    ? 'Daily Challenge'
+                    : 'Endless Survival'}
               </span>
               <span
                 data-testid="hud-chapter-episode"
@@ -236,7 +241,20 @@ export const GameHud: React.FC<GameHudProps> = ({
               </span>
             </div>
             <div className="h-6 sm:h-7 [@media(max-height:500px)]:h-5 w-px bg-slate-800" />
-            {hud.isBossEpisode ? (
+            {hud.mode !== 'campaign' ? (
+              <div className="flex flex-col items-center">
+                <span className="text-[9px] sm:text-[10px] [@media(max-height:500px)]:text-[8px] uppercase tracking-widest text-[#a3ff12]">
+                  {hud.mode === 'daily' ? hud.dailyChallengeTitle : 'No Timer'}
+                </span>
+                <span
+                  data-testid="hud-timer"
+                  title={hud.dailyChallengeDescription}
+                  className="font-display text-xs sm:text-sm [@media(max-height:500px)]:text-[11px] font-bold leading-none text-[#a3ff12] tracking-wider uppercase mt-0.5 whitespace-nowrap"
+                >
+                  {hud.mode === 'daily' ? 'Daily Run' : 'Survive'}
+                </span>
+              </div>
+            ) : hud.isBossEpisode ? (
               <div className="flex flex-col items-center">
                 <span className="text-[9px] sm:text-[10px] [@media(max-height:500px)]:text-[8px] uppercase tracking-widest text-[#ff007f]">
                   Episode 10
@@ -450,19 +468,21 @@ export const GameHud: React.FC<GameHudProps> = ({
             type="button"
             tabIndex={-1}
             data-testid="emp-button"
-            disabled={!empReady}
+            disabled={!empReady || hud.empDisabled}
             onClick={(e) => {
               e.currentTarget.blur();
               onTriggerEmp();
             }}
             aria-label={
-              empReady
+              hud.empDisabled
+                ? 'EMP disabled for today’s challenge'
+                : empReady
                 ? 'Activate EMP Emergency Bomb'
                 : `EMP recharging, ${hud.empCooldownRemaining} seconds remaining`
             }
             title="EMP Bomb [E]"
             className={`relative overflow-hidden select-none touch-manipulation min-h-[48px] [@media(max-height:500px)]:min-h-[44px] min-w-[98px] sm:min-w-[136px] flex items-center justify-between gap-2 px-2.5 sm:px-3.5 py-2 rounded-lg border transition-all ${
-              empReady
+              empAvailable
                 ? 'bg-[#0b0f19]/92 border-[#38bdf8]/85 text-[#38bdf8] shadow-[0_0_18px_rgba(56,189,248,0.24)] hover:bg-[#0f172a] hover:border-[#7dd3fc] active:scale-[0.98] cursor-pointer'
                 : 'bg-[#0b0f19]/88 border-slate-800 text-slate-400 cursor-not-allowed'
             }`}
@@ -485,13 +505,17 @@ export const GameHud: React.FC<GameHudProps> = ({
                   EMP
                 </span>
                 <span className="text-[9px] sm:text-[10px] font-mono-num uppercase tracking-wider opacity-85 mt-0.5">
-                  {empReady ? 'READY' : `${hud.empCooldownRemaining}s`}
+                  {hud.empDisabled
+                    ? 'DISABLED'
+                    : empReady
+                      ? 'READY'
+                      : `${hud.empCooldownRemaining}s`}
                 </span>
               </div>
             </div>
             <span
               className={`hidden sm:inline font-mono-num text-[10px] font-bold px-1.5 py-0.5 rounded border ${
-                empReady
+                empAvailable
                   ? 'border-[#38bdf8]/60 bg-[#38bdf8]/15 text-[#38bdf8]'
                   : 'border-slate-700 bg-slate-900 text-slate-500'
               }`}
@@ -501,7 +525,7 @@ export const GameHud: React.FC<GameHudProps> = ({
             <div className="absolute inset-x-0 bottom-0 h-1 bg-slate-900/90">
               <div
                 className={`h-full transition-[width] duration-150 ${
-                  empReady ? 'bg-[#38bdf8]' : 'bg-[#38bdf8]/50'
+                  empAvailable ? 'bg-[#38bdf8]' : 'bg-[#38bdf8]/50'
                 }`}
                 style={{ width: `${Math.round(empChargePct)}%` }}
               />

@@ -35,7 +35,7 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
         <div className="flex items-center justify-between gap-4 pb-4 border-b border-slate-800">
           <div>
             <p className="text-xs font-mono-num uppercase tracking-widest text-[#a3ff12]">
-              WOB · Top 10 Campaign Records
+              WOB · Top 10 Local Records
             </p>
             <h2
               id="leaderboard-title"
@@ -103,6 +103,10 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
                         <span className="font-mono-num font-semibold text-[#00f5d4]">
                           Ch. {entry.chapterReached} · Ep. {entry.episodeReached}/
                           {EPISODES_PER_CHAPTER}
+                        </span>
+                        <span className="hidden sm:inline text-slate-600">·</span>
+                        <span className="font-mono-num uppercase text-slate-400">
+                          {entry.mode}
                         </span>
                         <span className="hidden sm:inline text-slate-600">·</span>
                         <span className="hidden sm:inline font-mono-num text-slate-400">
