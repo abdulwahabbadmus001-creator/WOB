@@ -13,7 +13,11 @@ interface TitleOverlayProps {
   muted: boolean;
   unlockedCount: number;
   totalAchievements: number;
+  hangarScrap?: number;
+  isStandalone?: boolean;
   onStart: (mode: GameMode, weapon: WeaponType, skin: ShipSkin) => void;
+  onOpenCoopLobby?: (mode: GameMode, weapon: WeaponType, skin: ShipSkin) => void;
+  onOpenHangar?: (skin: ShipSkin) => void;
   onToggleMute: () => void;
   onInstall?: () => void;
   installHelp?: boolean;
@@ -26,7 +30,11 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
   muted,
   unlockedCount,
   totalAchievements,
+  hangarScrap = 0,
+  isStandalone = false,
   onStart,
+  onOpenCoopLobby,
+  onOpenHangar,
   onToggleMute,
   onInstall,
   installHelp = false,
@@ -42,19 +50,26 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
     <div className="absolute inset-0 z-20 flex flex-col justify-between p-5 sm:p-8 md:p-12 [@media(max-height:500px)]:p-3.5 pointer-events-none">
       {/* Top minimal utility corner */}
       <div className="flex items-center justify-end gap-2">
-        {onInstall && (
+        <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#0f172a]/90 border border-[#00f5d4]/35 text-[10px] font-mono-num uppercase tracking-wider text-[#00f5d4]">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#a3ff12]" />
+          {isStandalone ? 'PWA Standalone · 100% Offline' : '3D WebGL · 100% Offline Ready'}
+        </span>
+
+        {!isStandalone && onInstall && (
           <button
             type="button"
+            data-testid="install-app-button"
             onClick={(e) => {
               e.currentTarget.blur();
               onInstall();
             }}
             aria-label="Install WOB"
-            className="pointer-events-auto flex items-center gap-2 px-3.5 py-2 text-xs font-medium tracking-wide text-[#0b0f19] bg-[#00f5d4] rounded-lg hover:bg-[#38ffe5] transition-colors cursor-pointer"
+            className="pointer-events-auto flex items-center gap-2 px-3.5 py-2 text-xs font-medium tracking-wide text-[#070b14] bg-[#00f5d4] rounded-lg hover:bg-[#38ffe5] shadow-[0_0_16px_rgba(0,245,212,0.35)] transition-colors cursor-pointer"
           >
             Install App
           </button>
         )}
+
         <button
           type="button"
           onClick={(e) => {
@@ -165,8 +180,9 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
         <p className="text-sm [@media(max-height:500px)]:text-xs text-slate-300 mb-4 [@media(max-height:500px)]:mb-2.5 max-w-md leading-relaxed [@media(max-height:500px)]:leading-snug">
           Pilot <span className="text-[#00f5d4] font-semibold">Tommy</span>{' '}
           alongside wingman{' '}
-          <span className="text-[#a3ff12] font-semibold">Polly</span>. Survive the
-          campaign, take on endless waves, or try today&apos;s challenge.
+          <span className="text-[#a3ff12] font-semibold">Polly</span> or link up in{' '}
+          <span className="text-[#c084fc] font-semibold">2-Player Co-op Squadron</span>{' '}
+          to shatter 3D Capital Dreadnoughts.
         </p>
 
         {highScore > 0 && (
@@ -246,10 +262,38 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
               e.currentTarget.blur();
               onStart(selectedMode, selectedWeapon, selectedSkin);
             }}
-            className="pointer-events-auto px-7 py-3.5 [@media(max-height:500px)]:px-5 [@media(max-height:500px)]:py-2.5 text-base [@media(max-height:500px)]:text-sm font-display font-bold tracking-wider uppercase text-[#0b0f19] bg-[#00f5d4] rounded-lg shadow-[0_0_24px_rgba(0,245,212,0.4)] hover:bg-[#38ffe5] active:scale-[0.98] transition-all duration-150 cursor-pointer whitespace-nowrap"
+            className="pointer-events-auto px-6 py-3.5 [@media(max-height:500px)]:px-4 [@media(max-height:500px)]:py-2.5 text-base [@media(max-height:500px)]:text-sm font-display font-bold tracking-wider uppercase text-[#070b14] bg-[#00f5d4] rounded-lg shadow-[0_0_24px_rgba(0,245,212,0.4)] hover:bg-[#38ffe5] active:scale-[0.98] transition-all duration-150 cursor-pointer whitespace-nowrap"
           >
             Start {selectedMode === 'campaign' ? 'Campaign' : selectedMode === 'daily' ? 'Daily Run' : 'Survival'}
           </button>
+
+          {onOpenCoopLobby && (
+            <button
+              type="button"
+              data-testid="open-coop-button"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onOpenCoopLobby(selectedMode, selectedWeapon, selectedSkin);
+              }}
+              className="pointer-events-auto px-5 py-3.5 [@media(max-height:500px)]:px-4 [@media(max-height:500px)]:py-2.5 text-sm [@media(max-height:500px)]:text-xs font-display font-bold tracking-wider uppercase text-[#070b14] bg-[#a3ff12] rounded-lg shadow-[0_0_20px_rgba(163,255,18,0.35)] hover:bg-[#bfff55] active:scale-[0.98] transition-all cursor-pointer whitespace-nowrap"
+            >
+              Co-op Squadron
+            </button>
+          )}
+
+          {onOpenHangar && (
+            <button
+              type="button"
+              data-testid="open-hangar-button"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onOpenHangar(selectedSkin);
+              }}
+              className="pointer-events-auto px-4 py-3.5 [@media(max-height:500px)]:px-3.5 [@media(max-height:500px)]:py-2.5 text-sm [@media(max-height:500px)]:text-xs font-display font-bold tracking-wider uppercase text-[#38bdf8] bg-[#0f172a]/92 border border-[#38bdf8]/60 rounded-lg hover:border-[#38bdf8] hover:bg-[#38bdf8]/10 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              3D Hangar · {hangarScrap} Shards
+            </button>
+          )}
 
           <button
             type="button"
@@ -279,7 +323,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
       {/* Single flat control-hint line in bottom safe margin */}
       <div className="flex flex-col items-center sm:items-start gap-1">
         <p className="text-xs sm:text-sm [@media(max-height:500px)]:text-[11px] text-slate-400 tracking-wide font-mono-num">
-          Arrows / Touch-Drag Move · S or Right-Click Shield · Q Polly Assist · Space Dash · E EMP · P Pause
+          WASD / Arrows / Left Stick: Front·Back·Left·Right · Space / Shift / Right Pad: Up·Down · [C] Shield · [Q] Polly · [X] Dash · [E] EMP · [L] Fusion
         </p>
         {installHelp && (
           <p className="text-[11px] text-slate-500">

@@ -7,56 +7,90 @@ import {
   type AchievementStoreState,
 } from './achievements';
 import { soundFX } from './audio';
+import { coopSession, type CoopTelemetryPacket } from './coop';
 import {
   loadLeaderboard,
   qualifiesForLeaderboard,
 } from './leaderboard';
 import {
+  idbSet,
+  recordDailyChallengeRun,
+} from './persistence';
+import { WobRenderer3D } from './renderer3d';
+import {
   advanceCampaignProgress,
   advanceComboStreak,
   applyIncomingDamage,
   applyUpgradePurchase,
+  ARENA_MAX_ALTITUDE,
   BASE_EPISODE_DURATION_SECONDS,
   buildRunSummary,
+  CAMPAIGN_PROGRESS_STORAGE_KEY,
   circleIntersects,
   clampDeltaTime,
   COMBO_WINDOW_SECONDS,
   computeChapterBossConfig,
   computeComboRewards,
+  computeCoopScaling,
   computeEpisodeConfig,
   computePlayerStats,
+  createBossSubsystems,
   createChapterStarterUpgrades,
+  createInitialHangarUpgrades,
+  createInitialRoguePerks,
   createInitialUpgrades,
-  getDailyChallenge,
-  getShipSkinConfig,
   EMP_BLAST_DAMAGE,
   EMP_BLAST_RADIUS,
   EMP_COOLDOWN_SECONDS,
   EMP_STUN_SECONDS,
   EPISODES_PER_CHAPTER,
+  FLIGHT_SETTINGS_STORAGE_KEY,
+  getDailyChallenge,
+  getShipSkinConfig,
+  HANGAR_STORAGE_KEY,
+  loadFlightControlSettings,
+  loadHangarState,
   loadHighScore,
+  loadSavedCampaignProgress,
   pickEnemyKind,
+  pickRogueDraftChoices,
   POLLY_ASSIST_COOLDOWN,
   POLLY_ASSIST_DURATION,
   POLLY_AUTO_ENEMY_THRESHOLD,
   resolveEpisodeDefeat,
+  saveCampaignProgress,
+  saveFlightControlSettings,
+  saveHangarState,
   saveHighScore,
   SHIELD_REFLECT_BOLT_SPEED,
   SHIELD_REFLECT_DAMAGE,
+  SQUADRON_LINK_COOLDOWN,
+  SQUADRON_LINK_DURATION,
+  SQUADRON_TETHER_MAX_DIST,
   TACTICAL_SHIELD_COOLDOWN,
   TACTICAL_SHIELD_DURATION,
 } from './rules';
 import type {
   BossArchetype,
+  BossSubsystem,
+  CoopPilotConfig,
+  CoopRole,
   EnemyKind,
+  FlightControlSettings,
   GameMode,
   GameState,
+  HangarUpgradeLevels,
   HudSnapshot,
   PollyStatus,
+  RadarBlip,
+  RogueDraftId,
+  RogueDraftOption,
+  RoguePerkStacks,
   RunSummary,
+  ShipSkin,
+  TacticalPingKind,
   UpgradeId,
   UpgradeLevels,
-  ShipSkin,
   WeaponType,
 } from './types';
 
@@ -64,14 +98,17 @@ interface Bullet {
   active: boolean;
   x: number;
   y: number;
+  z?: number;
   vx: number;
   vy: number;
+  vz?: number;
   radius: number;
   damage: number;
   life: number;
   fromEnemy: boolean;
   color: string;
   homing?: boolean;
+  grazed?: boolean;
 }
 
 interface Enemy {
@@ -79,6 +116,7 @@ interface Enemy {
   kind: EnemyKind;
   x: number;
   y: number;
+  z?: number;
   vx: number;
   vy: number;
   radius: number;
@@ -116,6 +154,8 @@ interface Enemy {
   shielded?: boolean;
   shieldOpenTimer?: number;
   bossPhase?: number;
+  subsystems?: BossSubsystem[];
+  warpInTimer?: number;
 }
 
 interface EnergyOrb {
@@ -173,6 +213,22 @@ interface AsteroidHazard {
   life: number;
 }
 
+interface LightningArc {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  color: string;
+  life: number;
+}
+
+export interface CoopStartOptions {
+  enabled: boolean;
+  role: CoopRole;
+  roomCode: string;
+  partner: CoopPilotConfig;
+}
+
 export interface EngineCallbacks {
   onStateChange: (state: GameState) => void;
   onHudUpdate: (hud: HudSnapshot) => void;
@@ -181,6 +237,7 @@ export interface EngineCallbacks {
     state: AchievementStoreState,
     newlyUnlocked: AchievementDefinition[],
   ) => void;
+  onHangarScrapEarned?: (addedScrap: number) => void;
 }
 
 const PARTICLE_POOL_SIZE = 440;
@@ -193,6 +250,7 @@ const MAX_CONCURRENT_TELEGRAPHS = 3;
 export class WobGameEngine {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
+  private renderer3d: WobRenderer3D;
   private callbacks: EngineCallbacks;
 
   private width = 1280;
@@ -201,6 +259,11 @@ export class WobGameEngine {
   private resizeObserver: ResizeObserver | null = null;
   private rafId: number | null = null;
   private lastTimestamp = 0;
+
+  // Performance Auto-Scaler
+  private fpsQuality: 'high' | 'medium' | 'performance' = 'high';
+  private frameTimeAccumulator = 0;
+  private frameSampleCount = 0;
 
   private gameState: GameState = 'title';
   private overlayOpen = false;
@@ -212,11 +275,17 @@ export class WobGameEngine {
   private isDyingSequence = false;
   private episodeDamaged = false;
 
-  // Tommy (Player Core) state
+  // Near-Miss Graze & Kinetic Slow-Mo Focus
+  private grazeCount = 0;
+  private grazeSlowMoTimer = 0;
+
+  // Tommy (Player Core) 6-DOF 3D Flight state (Front, Back, Left, Right, Up, Down)
   private playerX = 640;
   private playerY = 360;
+  private playerZ = 0; // Altitude (-140..+140)
   private playerVx = 0;
   private playerVy = 0;
+  private playerVz = 0;
   private playerAngle = -Math.PI / 2;
   private playerRadius = 15;
   private playerHp = 100;
@@ -228,18 +297,22 @@ export class WobGameEngine {
   private playerScaleY = 1;
   private fireTimer = 0;
   private dashTimer = 0;
+  private dashDuration = 0.22;
   private dashCooldownTimer = 0;
   private dashBufferTimer = 0;
   private dashDirX = 0;
   private dashDirY = -1;
+  private dashDirZ = 0;
   private afterimageSpawnTimer = 0;
+  private playerDowned = false;
+  private playerReviveProgress = 0;
 
   // Tommy's Tactical Shield Button ability (S / Right-Click / HUD)
   private tacticalShieldActiveTimer = 0;
   private tacticalShieldCooldownTimer = 0;
   private tacticalShieldPulse = 0;
 
-  // Polly combat partner state
+  // Polly combat partner state + Twin Polly Drone
   private pollyX = 720;
   private pollyY = 300;
   private pollyAngle = -Math.PI / 2;
@@ -250,7 +323,51 @@ export class WobGameEngine {
   private pollyBeamTargetX = 0;
   private pollyBeamTargetY = 0;
   private pollyBeamFlashTimer = 0;
+  private pollyInterceptTimer = 0;
   private bossFightElapsed = 0;
+
+  private twinPollyX = 560;
+  private twinPollyY = 300;
+  private twinPollyAngle = -Math.PI / 2;
+  private twinPollyFireTimer = 0;
+
+  // Co-op Squadron Teammate & Squadron Fusion Link state
+  private coopActive = false;
+  private coopRole: CoopRole = 'solo';
+  private coopRoomCode = '';
+  private teammateCallsign = 'NOVA-2';
+  private teammateSkin: ShipSkin = 'violet';
+  private teammateWeapon: WeaponType = 'homing';
+  private teammateX = 580;
+  private teammateY = 400;
+  private teammateZ = 0;
+  private teammateVx = 0;
+  private teammateVy = 0;
+  private teammateAngle = -Math.PI / 2;
+  private teammateHp = 100;
+  private teammateMaxHp = 100;
+  private teammateShield = 30;
+  private teammateMaxShield = 30;
+  private teammateDowned = false;
+  private teammateReviveProgress = 0;
+  private teammateFireTimer = 0.15;
+  private teammateNetSyncTimer = 0;
+
+  // Squadron Link (Energy Tether & Twin-Core Heavy Gunship Fusion)
+  private squadronLinkEnergy = 100;
+  private squadronLinkActiveTimer = 0;
+  private squadronFusionDocked = false;
+  private squadronLinkCooldownTimer = 0;
+  private tetherDamageTickTimer = 0;
+
+  // Tactical Callout Pings
+  private activePing: {
+    sender: string;
+    kind: TacticalPingKind;
+    text: string;
+    timer: number;
+  } | null = null;
+  private focusCoreBuffTimer = 0;
 
   // Endless Chapter & Episode Campaign Progression
   private mode: GameMode = 'campaign';
@@ -276,6 +393,10 @@ export class WobGameEngine {
   private enemiesDefeated = 0;
   private bossesDefeated = 0;
   private upgrades: UpgradeLevels = createInitialUpgrades();
+  private hangarLevels: HangarUpgradeLevels = createInitialHangarUpgrades();
+  private roguePerks: RoguePerkStacks = createInitialRoguePerks();
+  private draftPending = false;
+  private draftChoices: RogueDraftOption[] = [];
   private achievementState: AchievementStoreState = loadAchievementState();
   private lastDefeatBossName: string | undefined = undefined;
 
@@ -304,7 +425,7 @@ export class WobGameEngine {
   private pollyBannerTimer = 0;
   private titleTime = 0;
 
-  // Input state
+  // Input state, 6-DOF Flight Settings, Mobile Dual-Stick & Gamepad
   private keysHeld = new Set<string>();
   private pointerActive = false;
   private activePointerId: number | null = null;
@@ -312,6 +433,14 @@ export class WobGameEngine {
   private pointerWorldY = 360;
   private pointerHoverX = 520;
   private pointerHoverY = 220;
+  private joystickActive = false;
+  private joystickDx = 0;
+  private joystickDy = 0;
+  private altitudeTouchInput = 0; // -1 (Down) .. +1 (Up)
+  private manualFireHeld = false;
+  private flightSettings: FlightControlSettings = loadFlightControlSettings();
+  private gamepadConnected = false;
+  private gamepadPrevButtons: boolean[] = [];
 
   // Entity pools
   private enemies: Enemy[] = [];
@@ -324,6 +453,7 @@ export class WobGameEngine {
   private afterimages: Afterimage[] = [];
   private afterimageCursor = 0;
   private hazards: AsteroidHazard[] = [];
+  private lightningArcs: LightningArc[] = [];
 
   private bgMotes: Array<{
     x: number;
@@ -343,8 +473,10 @@ export class WobGameEngine {
     }
     this.ctx = context;
     this.callbacks = callbacks;
+    this.renderer3d = new WobRenderer3D();
     this.highScore = loadHighScore();
     this.initialHighScore = this.highScore;
+    this.hangarLevels = loadHangarState().levels;
 
     if (typeof window !== 'undefined') {
       const searchParams = new URLSearchParams(window.location.search);
@@ -368,6 +500,8 @@ export class WobGameEngine {
       }
     }
 
+    coopSession.setCallbacks((packet) => this.handleCoopPacket(packet));
+
     this.initPools();
     this.setupResizeObserver();
     this.pointerHoverX = this.width * 0.42;
@@ -377,6 +511,198 @@ export class WobGameEngine {
     this.syncBodyState('title');
     this.pushHudSnapshot();
     this.callbacks.onAchievementUpdate?.(this.achievementState, []);
+  }
+
+  public setHangarUpgrades(levels: HangarUpgradeLevels): void {
+    this.hangarLevels = { ...levels };
+    this.needsStaticRender = true;
+    this.pushHudSnapshot();
+  }
+
+  public setVirtualJoystick(dx: number, dy: number, active: boolean): void {
+    this.joystickActive = active;
+    this.joystickDx = dx;
+    this.joystickDy = dy;
+    if (active) {
+      soundFX.unlock();
+    }
+  }
+
+  public setAltitudeControl(vzRatio: number): void {
+    this.altitudeTouchInput = Math.max(-1, Math.min(1, vzRatio));
+    if (Math.abs(vzRatio) > 0.05) {
+      soundFX.unlock();
+    }
+  }
+
+  public setManualFireHeld(held: boolean): void {
+    this.manualFireHeld = held;
+    if (held) {
+      soundFX.unlock();
+    }
+  }
+
+  public getFlightSettings(): FlightControlSettings {
+    return { ...this.flightSettings };
+  }
+
+  public setFlightSettings(settings: FlightControlSettings): void {
+    this.flightSettings = { ...settings };
+    saveFlightControlSettings(this.flightSettings);
+    void idbSet(FLIGHT_SETTINGS_STORAGE_KEY, this.flightSettings);
+    this.pushHudSnapshot();
+  }
+
+  public toggleAutoFire(): boolean {
+    this.flightSettings = {
+      ...this.flightSettings,
+      autoFire: !this.flightSettings.autoFire,
+    };
+    saveFlightControlSettings(this.flightSettings);
+    void idbSet(FLIGHT_SETTINGS_STORAGE_KEY, this.flightSettings);
+    this.pushHudSnapshot();
+    return this.flightSettings.autoFire;
+  }
+
+  public triggerDash(): boolean {
+    if (this.gameState !== 'playing' || this.isDyingSequence) return false;
+    soundFX.unlock();
+    this.dashBufferTimer = 0.18;
+    return true;
+  }
+
+  public selectRogueDraft(perkId: RogueDraftId): void {
+    this.roguePerks[perkId] = (this.roguePerks[perkId] ?? 0) + 1;
+    this.draftPending = false;
+    soundFX.playUpgradeBuy();
+    this.spawnLabel(
+      this.playerX,
+      this.playerY - 28,
+      `DRAFTED: ${perkId.replace('_', ' ').toUpperCase()}`,
+      '#a3ff12',
+    );
+    this.pushHudSnapshot();
+  }
+
+  public triggerSquadronLink(dockGunship = true): boolean {
+    if (
+      this.gameState !== 'playing' ||
+      this.isDyingSequence ||
+      !this.coopActive ||
+      this.teammateDowned ||
+      this.playerDowned ||
+      this.squadronLinkActiveTimer > 0 ||
+      this.squadronLinkCooldownTimer > 0
+    ) {
+      return false;
+    }
+
+    soundFX.unlock();
+    soundFX.playSquadronLink(dockGunship);
+    const bonusDuration = this.roguePerks.tether_overdrive * 2.5;
+    this.squadronLinkActiveTimer = SQUADRON_LINK_DURATION + bonusDuration;
+    this.squadronFusionDocked = dockGunship;
+    this.squadronLinkEnergy = 100;
+    this.playerInvuln = Math.max(this.playerInvuln, 0.8);
+
+    this.emitParticles(this.playerX, this.playerY, '#00f5d4', 24, 240, 0.42, false);
+    this.emitParticles(this.teammateX, this.teammateY, '#c084fc', 24, 240, 0.42, true);
+    this.spawnLabel(
+      this.playerX,
+      this.playerY - 36,
+      dockGunship ? 'TWIN-CORE GUNSHIP FUSION!' : 'SQUADRON PLASMA TETHER!',
+      '#00f5d4',
+    );
+
+    coopSession.sendPacket({
+      type: 'trigger_link',
+      roomCode: this.coopRoomCode,
+      senderRole: this.coopRole,
+      docked: dockGunship,
+    });
+
+    this.pushHudSnapshot();
+    return true;
+  }
+
+  public sendTacticalPing(kind: TacticalPingKind, fromRemote = false): void {
+    if (this.gameState !== 'playing') return;
+    soundFX.unlock();
+    soundFX.playTacticalPing(kind);
+
+    const text =
+      kind === 'focus_core'
+        ? 'FOCUS CORE & WEAK POINTS!'
+        : kind === 'link_up'
+          ? 'SQUADRON LINK UP!'
+          : 'NEED SHIELD ASSIST!';
+
+    const sender = fromRemote ? this.teammateCallsign : 'TOMMY';
+    this.activePing = {
+      sender,
+      kind,
+      text,
+      timer: 3.2,
+    };
+
+    this.spawnLabel(
+      this.playerX,
+      this.playerY - 40,
+      `[${sender}] ${text}`,
+      kind === 'focus_core' ? '#ff007f' : kind === 'link_up' ? '#00f5d4' : '#a3ff12',
+    );
+
+    if (kind === 'focus_core') {
+      this.focusCoreBuffTimer = 5.5;
+    } else if (kind === 'link_up' && this.coopActive) {
+      if (this.squadronLinkCooldownTimer <= 0 && this.squadronLinkActiveTimer <= 0) {
+        this.triggerSquadronLink(true);
+      }
+    } else if (kind === 'need_shield' && this.coopActive && !this.teammateDowned) {
+      const stats = computePlayerStats(this.upgrades, this.hangarLevels);
+      this.playerShield = Math.min(
+        Math.max(30, stats.maxShield),
+        this.playerShield + 25,
+      );
+      this.emitParticles(this.playerX, this.playerY, '#a3ff12', 14, 180, 0.3, false);
+    }
+
+    if (!fromRemote && this.coopActive) {
+      coopSession.sendPacket({
+        type: 'tactical_ping',
+        roomCode: this.coopRoomCode,
+        senderRole: this.coopRole,
+        ping: { sender, kind, text },
+      });
+    }
+    this.pushHudSnapshot();
+  }
+
+  private handleCoopPacket(packet: CoopTelemetryPacket): void {
+    if (!this.coopActive) return;
+    if (packet.type === 'pilot_state' && packet.state) {
+      const s = packet.state;
+      this.teammateX = s.x;
+      this.teammateY = s.y;
+      this.teammateVx = s.vx;
+      this.teammateVy = s.vy;
+      this.teammateAngle = s.angle;
+      this.teammateHp = s.hp;
+      this.teammateMaxHp = s.maxHp;
+      this.teammateShield = s.shield;
+      this.teammateMaxShield = s.maxShield;
+      this.teammateDowned = s.downed;
+      this.teammateSkin = s.skin;
+      this.teammateWeapon = s.weapon;
+      this.teammateCallsign = s.callsign;
+    } else if (packet.type === 'tactical_ping' && packet.ping) {
+      this.sendTacticalPing(packet.ping.kind, true);
+    } else if (packet.type === 'trigger_link') {
+      if (this.squadronLinkActiveTimer <= 0) {
+        this.squadronLinkCooldownTimer = 0;
+        this.triggerSquadronLink(Boolean(packet.docked));
+      }
+    }
   }
 
   private recordAchievementProgress(delta: AchievementDelta): void {
@@ -402,6 +728,7 @@ export class WobGameEngine {
       fromEnemy: false,
       color: '#00f5d4',
       homing: false,
+      grazed: false,
     }));
 
     this.orbs = Array.from({ length: ORB_POOL_SIZE }, () => ({
@@ -472,6 +799,7 @@ export class WobGameEngine {
       this.height = nextH;
       this.canvas.width = Math.round(nextW * this.dpr);
       this.canvas.height = Math.round(nextH * this.dpr);
+      this.renderer3d.resize(nextW, nextH, this.dpr);
 
       this.playerX = Math.max(
         this.playerRadius + 8,
@@ -541,6 +869,70 @@ export class WobGameEngine {
         }
       }
 
+      if (this.gameState === 'playing') {
+        this.keysHeld.add(code);
+        if (e.repeat) return;
+
+        if (code === 'KeyM') {
+          soundFX.toggleMute();
+          this.pushHudSnapshot();
+          return;
+        }
+        if (code === 'Escape' || code === 'KeyP') {
+          this.pauseGame();
+          return;
+        }
+        // Tactical Shield: [C] or Right-Click or HUD button (leaving [S] free for 100% manual Back/Reverse movement!)
+        if (code === 'KeyC') {
+          this.activateTacticalShield();
+          return;
+        }
+        // Barrel-Roll Dash: [X] or [V] (or Space/Shift when altitude keys are Q/E or R/F)
+        if (
+          code === 'KeyX' ||
+          code === 'KeyV' ||
+          (this.flightSettings.altitudeKeys !== 'space_shift' &&
+            (code === 'Space' || code === 'ShiftLeft' || code === 'ShiftRight'))
+        ) {
+          this.dashBufferTimer = 0.16;
+          return;
+        }
+        // Polly Partner Assist: [Q] (when Q/E is not mapped to Up/Down altitude) or [Tab]
+        if (
+          code === 'Tab' ||
+          (this.flightSettings.altitudeKeys !== 'q_e' && code === 'KeyQ')
+        ) {
+          e.preventDefault();
+          this.triggerPollyAssist(false);
+          return;
+        }
+        // EMP Emergency Bomb: [E] (when Q/E is not mapped to Up/Down altitude) or [KeyB]
+        if (
+          code === 'KeyB' ||
+          (this.flightSettings.altitudeKeys !== 'q_e' && code === 'KeyE')
+        ) {
+          this.triggerEmp();
+          return;
+        }
+        if (code === 'KeyG' || (this.coopRole !== 'dual_local' && code === 'KeyL')) {
+          this.triggerSquadronLink(true);
+          return;
+        }
+        if (code === 'Digit1') {
+          this.sendTacticalPing('focus_core');
+          return;
+        }
+        if (code === 'Digit2') {
+          this.sendTacticalPing('link_up');
+          return;
+        }
+        if (code === 'Digit3') {
+          this.sendTacticalPing('need_shield');
+          return;
+        }
+        return;
+      }
+
       if (e.repeat) return;
 
       if (code === 'KeyM') {
@@ -554,34 +946,6 @@ export class WobGameEngine {
         if (code === 'Enter' || code === 'Space') {
           this.startNewGame(true);
         }
-        return;
-      }
-
-      if (this.gameState === 'playing') {
-        if (code === 'Escape' || code === 'KeyP') {
-          this.pauseGame();
-          return;
-        }
-        if (code === 'KeyR') {
-          this.startNewGame(true);
-          return;
-        }
-        if (code === 'KeyS') {
-          this.activateTacticalShield();
-          return;
-        }
-        if (code === 'KeyQ' || code === 'KeyF') {
-          this.triggerPollyAssist(false);
-          return;
-        }
-        if (code === 'KeyE') {
-          this.triggerEmp();
-          return;
-        }
-        if (code === 'Space' || code === 'ShiftLeft' || code === 'ShiftRight') {
-          this.dashBufferTimer = 0.14;
-        }
-        this.keysHeld.add(code);
         return;
       }
 
@@ -629,7 +993,6 @@ export class WobGameEngine {
       const pt = this.screenToWorld(e.clientX, e.clientY);
       this.pointerHoverX = pt.x;
       this.pointerHoverY = pt.y;
-      // Right-click triggers Tommy's Tactical Shield!
       if (e.button === 2) {
         if (this.gameState === 'playing') {
           this.activateTacticalShield();
@@ -690,6 +1053,7 @@ export class WobGameEngine {
       this.keysHeld.clear();
       this.pointerActive = false;
       this.activePointerId = null;
+      this.joystickActive = false;
     };
 
     const onVisibilityChange = () => {
@@ -727,6 +1091,22 @@ export class WobGameEngine {
       this.lastTimestamp = now;
       const dt = clampDeltaTime(rawDt);
 
+      // Automatic FPS Quality Scaler
+      this.frameTimeAccumulator += rawDt;
+      this.frameSampleCount += 1;
+      if (this.frameSampleCount >= 45) {
+        const avgMs = (this.frameTimeAccumulator / this.frameSampleCount) * 1000;
+        if (avgMs > 24 && this.fpsQuality === 'high') {
+          this.fpsQuality = 'medium';
+        } else if (avgMs > 28 && this.fpsQuality === 'medium') {
+          this.fpsQuality = 'performance';
+        } else if (avgMs < 17.5 && this.fpsQuality !== 'high') {
+          this.fpsQuality = 'high';
+        }
+        this.frameTimeAccumulator = 0;
+        this.frameSampleCount = 0;
+      }
+
       if (!this.overlayOpen && (this.gameState === 'title' || this.gameState === 'playing')) {
         this.update(dt);
         this.render();
@@ -751,6 +1131,8 @@ export class WobGameEngine {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
+    soundFX.stopMusic();
+    this.renderer3d.dispose();
     this.cleanupResize();
     this.cleanupInputs();
   }
@@ -760,6 +1142,11 @@ export class WobGameEngine {
     this.needsStaticRender = true;
     if (typeof document !== 'undefined') {
       document.body.dataset.state = state;
+    }
+    if (state === 'title') {
+      soundFX.setMusicIntensity('title');
+    } else if (state === 'playing') {
+      soundFX.setMusicIntensity('skirmish');
     }
     this.callbacks.onStateChange(state);
   }
@@ -771,6 +1158,7 @@ export class WobGameEngine {
     mode: GameMode = 'campaign',
     weapon: WeaponType = 'spread',
     skin: ShipSkin = 'cyan',
+    coopOptions?: CoopStartOptions,
   ): void {
     if (fromUserGesture) {
       soundFX.unlock();
@@ -780,6 +1168,7 @@ export class WobGameEngine {
     }
     this.keysHeld.clear();
     this.pointerActive = false;
+    this.joystickActive = false;
 
     this.mode = mode;
     this.selectedWeapon = weapon;
@@ -793,12 +1182,21 @@ export class WobGameEngine {
       this.chapter > 1 || this.episode === EPISODES_PER_CHAPTER
         ? createChapterStarterUpgrades(this.chapter)
         : createInitialUpgrades();
-    const stats = computePlayerStats(this.upgrades);
+    this.hangarLevels = loadHangarState().levels;
+    this.roguePerks = createInitialRoguePerks();
+    this.draftPending = false;
+    this.draftChoices = [];
+
+    const stats = computePlayerStats(this.upgrades, this.hangarLevels);
 
     this.playerX = this.width * 0.5;
     this.playerY = this.height * 0.5;
+    this.playerZ = 0;
     this.playerVx = 0;
     this.playerVy = 0;
+    this.playerVz = 0;
+    this.altitudeTouchInput = 0;
+    this.manualFireHeld = false;
     this.playerAngle = -Math.PI / 2;
     this.playerHp =
       this.configuredStartHp !== null
@@ -816,6 +1214,8 @@ export class WobGameEngine {
     this.playerHitFlash = 0;
     this.playerScaleX = 1;
     this.playerScaleY = 1;
+    this.playerDowned = false;
+    this.playerReviveProgress = 0;
 
     this.fireTimer = 0.1;
     this.dashTimer = 0;
@@ -832,8 +1232,46 @@ export class WobGameEngine {
     this.pollyCooldownTimer = 0;
     this.pollyFireTimer = 0;
     this.pollyBeamFlashTimer = 0;
+    this.pollyInterceptTimer = 0;
     this.bossFightElapsed = 0;
     this.episodeDamaged = false;
+
+    this.twinPollyX = this.playerX - 70;
+    this.twinPollyY = this.playerY - 50;
+    this.twinPollyFireTimer = 0.25;
+
+    // Co-op Squadron initialization
+    if (coopOptions?.enabled) {
+      this.coopActive = true;
+      this.coopRole = coopOptions.role;
+      this.coopRoomCode = coopOptions.roomCode;
+      this.teammateCallsign = coopOptions.partner.callsign || 'NOVA-2';
+      this.teammateSkin = coopOptions.partner.skin || 'violet';
+      this.teammateWeapon = coopOptions.partner.weapon || 'homing';
+      this.teammateX = this.playerX - 85;
+      this.teammateY = this.playerY + 45;
+      this.teammateVx = 0;
+      this.teammateVy = 0;
+      this.teammateMaxHp = stats.maxHp;
+      this.teammateHp = stats.maxHp;
+      this.teammateMaxShield = Math.max(30, stats.maxShield);
+      this.teammateShield = this.teammateMaxShield;
+      this.teammateDowned = false;
+      this.teammateReviveProgress = 0;
+    } else {
+      this.coopActive = false;
+      this.coopRole = 'solo';
+    }
+
+    this.squadronLinkEnergy = 100;
+    this.squadronLinkActiveTimer = 0;
+    this.squadronFusionDocked = false;
+    this.squadronLinkCooldownTimer = 0;
+    this.activePing = null;
+    this.focusCoreBuffTimer = 0;
+    this.grazeCount = 0;
+    this.grazeSlowMoTimer = 0;
+    this.lightningArcs = [];
 
     this.score = 0;
     this.highScore = loadHighScore();
@@ -865,7 +1303,27 @@ export class WobGameEngine {
   public retryChapterFromEpisode1(targetChapter = this.chapter): void {
     soundFX.unlock();
     this.configuredStartHp = null;
-    this.startNewGame(true, Math.max(1, targetChapter), 1);
+    this.startNewGame(
+      true,
+      Math.max(1, targetChapter),
+      1,
+      this.mode,
+      this.selectedWeapon,
+      this.selectedShipSkin,
+      this.coopActive
+        ? {
+            enabled: true,
+            role: this.coopRole,
+            roomCode: this.coopRoomCode,
+            partner: {
+              callsign: this.teammateCallsign,
+              skin: this.teammateSkin,
+              weapon: this.teammateWeapon,
+              ready: true,
+            },
+          }
+        : undefined,
+    );
   }
 
   private setupEpisode(
@@ -886,6 +1344,7 @@ export class WobGameEngine {
     this.ambientOrbTimer = 2.6;
     this.hazardTimer = 7;
     this.hazards = [];
+    this.lightningArcs = [];
     this.bossBannerTimer = 0;
     this.pollyBannerTimer = 0;
     this.bossFightElapsed = 0;
@@ -913,11 +1372,16 @@ export class WobGameEngine {
 
     if (epCfg.isBossEpisode) {
       this.spawnChapterBoss(this.chapter);
+      soundFX.setMusicIntensity('boss');
     } else if (epCfg.shouldSpawnSubBoss) {
       this.spawnSubBoss();
+      soundFX.setMusicIntensity('boss');
     } else {
       this.bossBannerTimer = 2.0;
-      this.bossBannerText = `CHAPTER ${this.chapter} · EPISODE ${this.episode}/${EPISODES_PER_CHAPTER}`;
+      this.bossBannerText = this.coopActive
+        ? `CO-OP OVERDRIVE · CH ${this.chapter} · EP ${this.episode}/${EPISODES_PER_CHAPTER}`
+        : `CHAPTER ${this.chapter} · EPISODE ${this.episode}/${EPISODES_PER_CHAPTER}`;
+      soundFX.setMusicIntensity('skirmish');
     }
   }
 
@@ -925,6 +1389,7 @@ export class WobGameEngine {
     if (this.gameState !== 'playing' || this.isDyingSequence) return;
     this.keysHeld.clear();
     this.pointerActive = false;
+    this.joystickActive = false;
     this.syncBodyState('paused');
     this.pushHudSnapshot();
   }
@@ -943,6 +1408,7 @@ export class WobGameEngine {
   public returnToTitle(): void {
     this.keysHeld.clear();
     this.pointerActive = false;
+    this.joystickActive = false;
     this.enemies = [];
     for (const b of this.bullets) b.active = false;
     for (const o of this.orbs) o.active = false;
@@ -963,7 +1429,7 @@ export class WobGameEngine {
 
     this.upgrades = res.upgrades;
     this.shards = res.shards;
-    const stats = computePlayerStats(this.upgrades);
+    const stats = computePlayerStats(this.upgrades, this.hangarLevels);
 
     if (id === 'shield') {
       this.playerHp = Math.min(stats.maxHp, this.playerHp + 35);
@@ -983,6 +1449,7 @@ export class WobGameEngine {
     }
     this.keysHeld.clear();
     this.pointerActive = false;
+    this.draftPending = false;
 
     const next = advanceCampaignProgress(this.chapter, this.episode);
     this.chapter = next.nextChapter;
@@ -1001,15 +1468,21 @@ export class WobGameEngine {
     }
     this.keysHeld.clear();
     this.pointerActive = false;
+    this.draftPending = false;
 
     this.chapter += 1;
     this.episode = 1;
-    const stats = computePlayerStats(this.upgrades);
+    const stats = computePlayerStats(this.upgrades, this.hangarLevels);
     this.playerHp = stats.maxHp;
     this.playerShield = stats.maxShield;
     this.playerInvuln = 1.6;
     this.tacticalShieldCooldownTimer = 0;
     this.pollyCooldownTimer = 0;
+    if (this.coopActive) {
+      this.teammateHp = this.teammateMaxHp;
+      this.teammateShield = this.teammateMaxShield;
+      this.teammateDowned = false;
+    }
 
     this.setupEpisode(this.chapter, 1, true);
     this.syncBodyState('playing');
@@ -1085,15 +1558,18 @@ export class WobGameEngine {
     }
 
     const epCfg = computeEpisodeConfig(this.chapter, this.episode);
+    const coopScale = computeCoopScaling(this.coopActive);
     const dailyEnemyHealth =
       this.mode === 'daily' ? this.dailyChallenge.enemyHealthMultiplier : 1;
     const dailyEnemySpeed =
       this.mode === 'daily' ? this.dailyChallenge.speedMultiplier : 1;
     const bossHp = Math.round(
-      (340 * epCfg.hpMultiplier + this.episode * 75) * dailyEnemyHealth,
+      (340 * epCfg.hpMultiplier + this.episode * 75) *
+        dailyEnemyHealth *
+        coopScale.bossHpMult,
     );
 
-    this.enemies.push({
+    const subBoss: Enemy = {
       id: this.nextEnemyId++,
       kind: 'boss',
       isChapterBoss: false,
@@ -1101,7 +1577,7 @@ export class WobGameEngine {
       y,
       vx: 0,
       vy: 0,
-      radius: 34,
+      radius: 36,
       hp: bossHp,
       maxHp: bossHp,
       speed: 82 * (1 + (this.chapter - 1) * 0.14) * dailyEnemySpeed,
@@ -1117,21 +1593,28 @@ export class WobGameEngine {
       aimAngle: 0,
       glitchTimer: 0,
       orbitDir: Math.random() < 0.5 ? 1 : -1,
-      bossTitle: `GATEKEEPER MK-${this.chapter}.${this.episode}`,
-    });
+      bossTitle: `CRUISER GATEKEEPER MK-${this.chapter}.${this.episode}`,
+      subsystems: createBossSubsystems(bossHp, false),
+      warpInTimer: 0.7,
+    };
+    this.updateBossSubsystemPositions(subBoss);
+    this.enemies.push(subBoss);
+    this.spawnBossDataDrones(subBoss, 2);
 
     this.bossBannerTimer = 2.6;
-    this.bossBannerText = `SUB-BOSS GATEKEEPER · EPISODE ${this.episode}`;
+    this.bossBannerText = `CAPITAL CRUISER WARP-IN · EPISODE ${this.episode}`;
     soundFX.playBossAlert();
     this.addTrauma(0.35);
   }
 
   private spawnChapterBoss(chapter: number): void {
     const cfg = computeChapterBossConfig(chapter);
+    const coopScale = computeCoopScaling(this.coopActive);
+    const scaledHp = Math.round(cfg.hp * coopScale.bossHpMult);
     const x = this.width * 0.5;
     const y = -58;
 
-    this.enemies.push({
+    const boss: Enemy = {
       id: this.nextEnemyId++,
       kind: 'boss',
       isChapterBoss: true,
@@ -1139,9 +1622,9 @@ export class WobGameEngine {
       y,
       vx: 0,
       vy: 0,
-      radius: cfg.radius,
-      hp: cfg.hp,
-      maxHp: cfg.hp,
+      radius: cfg.radius + 6,
+      hp: scaledHp,
+      maxHp: scaledHp,
       speed: cfg.speed,
       damage: cfg.damage,
       scoreValue: cfg.scoreValue,
@@ -1156,7 +1639,7 @@ export class WobGameEngine {
       glitchTimer: 0,
       orbitDir: Math.random() < 0.5 ? 1 : -1,
       bossArchetype: cfg.archetype,
-      bossTitle: cfg.title,
+      bossTitle: this.coopActive ? `ELITE ${cfg.title}` : cfg.title,
       attackPhase: 0,
       laserActiveTimer: 0,
       laserAngle: 0,
@@ -1169,19 +1652,35 @@ export class WobGameEngine {
       droneCount: cfg.droneCount,
       aggressionRate: cfg.aggressionRate,
       bossPhase: 0,
-    });
+      subsystems: createBossSubsystems(scaledHp, true),
+      warpInTimer: 0.9,
+    };
+    this.updateBossSubsystemPositions(boss);
+    this.enemies.push(boss);
+    this.spawnBossDataDrones(boss, 3);
 
     this.bossBannerTimer = 3.2;
-    this.bossBannerText = `CHAPTER ${cfg.chapter} BOSS · ${cfg.title}`;
+    this.bossBannerText = `DREADNOUGHT WARP-IN · ${boss.bossTitle}`;
     soundFX.playBossAlert();
     this.addTrauma(0.5);
+  }
+
+  private updateBossSubsystemPositions(boss: Enemy): void {
+    if (!boss.subsystems) return;
+    for (const sub of boss.subsystems) {
+      sub.hitFlash = Math.max(0, sub.hitFlash - 0.016);
+      const ang = boss.angle + sub.offsetAngle;
+      const dist = boss.radius * sub.offsetRadiusRatio;
+      sub.worldX = boss.x + Math.cos(ang) * dist;
+      sub.worldY = boss.y + Math.sin(ang) * dist;
+    }
   }
 
   private spawnBossDataDrones(boss: Enemy, count: number): void {
     const activeMinions = this.enemies.filter(
       (e) => e.dyingTimer <= 0 && e.isBossMinion,
     ).length;
-    const allowed = Math.max(0, 5 - activeMinions);
+    const allowed = Math.max(0, 6 - activeMinions);
     const toSpawn = Math.min(allowed, count);
     if (toSpawn <= 0) return;
 
@@ -1250,7 +1749,6 @@ export class WobGameEngine {
           this.pointerHoverX - this.playerX,
         ) || -Math.PI / 2;
 
-      // Polly wingman showcase orbit beside Tommy on Title Screen
       const pollyTargetX = this.playerX + Math.cos(this.titleTime * 1.35) * 86;
       const pollyTargetY = this.playerY + Math.sin(this.titleTime * 1.35) * 64;
       this.pollyX += (pollyTargetX - this.pollyX) * Math.min(1, dt * 5);
@@ -1269,6 +1767,23 @@ export class WobGameEngine {
     this.pollyBannerTimer = Math.max(0, this.pollyBannerTimer - dt);
     this.pollyBeamFlashTimer = Math.max(0, this.pollyBeamFlashTimer - dt);
     this.tacticalShieldPulse = Math.max(0, this.tacticalShieldPulse - dt * 2.5);
+    this.focusCoreBuffTimer = Math.max(0, this.focusCoreBuffTimer - dt);
+    this.grazeSlowMoTimer = Math.max(0, this.grazeSlowMoTimer - dt);
+
+    if (this.activePing) {
+      this.activePing.timer -= dt;
+      if (this.activePing.timer <= 0) {
+        this.activePing = null;
+      }
+    }
+
+    for (let i = this.lightningArcs.length - 1; i >= 0; i--) {
+      this.lightningArcs[i].life -= dt;
+      if (this.lightningArcs[i].life <= 0) {
+        this.lightningArcs.splice(i, 1);
+      }
+    }
+
     this.updateParticles(dt);
     this.updateLabels(dt);
     this.updateAfterimages(dt);
@@ -1294,21 +1809,56 @@ export class WobGameEngine {
       return;
     }
 
-    const stats = computePlayerStats(this.upgrades);
+    const stats = computePlayerStats(this.upgrades, this.hangarLevels);
+    const haste = stats.cooldownHaste ?? 1;
+
+    // Kinetic Slow-Mo Focus factor for enemy bullets & enemies when Grazing
+    const worldDt = this.grazeSlowMoTimer > 0 ? dt * 0.52 : dt;
 
     // Cooldowns & combo decay
-    this.empCooldownTimer = Math.max(0, this.empCooldownTimer - dt);
+    this.empCooldownTimer = Math.max(0, this.empCooldownTimer - dt * haste);
     if (this.tacticalShieldActiveTimer > 0) {
       this.tacticalShieldActiveTimer -= dt;
       if (this.tacticalShieldActiveTimer <= 0) {
         this.tacticalShieldActiveTimer = 0;
-        this.tacticalShieldCooldownTimer = TACTICAL_SHIELD_COOLDOWN;
+        this.tacticalShieldCooldownTimer = TACTICAL_SHIELD_COOLDOWN / haste;
       }
     } else {
       this.tacticalShieldCooldownTimer = Math.max(
         0,
-        this.tacticalShieldCooldownTimer - dt,
+        this.tacticalShieldCooldownTimer - dt * haste,
       );
+    }
+
+    // Squadron Link & Twin-Core Heavy Gunship Fusion Timer
+    if (this.squadronLinkActiveTimer > 0) {
+      this.squadronLinkActiveTimer -= dt;
+      this.squadronLinkEnergy = Math.max(
+        0,
+        (this.squadronLinkActiveTimer /
+          (SQUADRON_LINK_DURATION + this.roguePerks.tether_overdrive * 2.5)) *
+          100,
+      );
+      soundFX.setMusicIntensity('fusion');
+      if (this.squadronLinkActiveTimer <= 0) {
+        this.squadronLinkActiveTimer = 0;
+        this.squadronFusionDocked = false;
+        this.squadronLinkCooldownTimer = SQUADRON_LINK_COOLDOWN / haste;
+        const hasBoss = this.enemies.some((e) => e.kind === 'boss' && e.dyingTimer <= 0);
+        soundFX.setMusicIntensity(hasBoss ? 'boss' : 'skirmish');
+      }
+    } else {
+      this.squadronLinkCooldownTimer = Math.max(
+        0,
+        this.squadronLinkCooldownTimer - dt * haste,
+      );
+      this.squadronLinkEnergy =
+        this.squadronLinkCooldownTimer <= 0
+          ? 100
+          : Math.round(
+              (1 - this.squadronLinkCooldownTimer / (SQUADRON_LINK_COOLDOWN / haste)) *
+                100,
+            );
     }
 
     if (this.comboTimer > 0) {
@@ -1326,6 +1876,7 @@ export class WobGameEngine {
       this.episode,
       this.configuredEpisodeDuration,
     );
+    const coopScale = computeCoopScaling(this.coopActive);
     const endlessMode = this.mode !== 'campaign';
 
     if (endlessMode) {
@@ -1353,30 +1904,39 @@ export class WobGameEngine {
       this.bossFightElapsed += dt;
     }
 
-    // Update Tommy
+    // Update Tommy & Co-op Teammate
     this.updatePlayer(dt, stats);
-    this.updateHazards(dt);
+    this.updateCoopTeammate(dt, stats);
+    this.updateHazards(worldDt);
 
-    // Auto-fire Tommy's lasers
-    this.fireTimer -= dt;
-    if (this.fireTimer <= 0) {
-      this.firePlayerLasers(stats);
-      this.fireTimer =
-        stats.fireInterval *
-        (this.selectedWeapon === 'plasma'
-          ? 1.65
-          : this.selectedWeapon === 'laser'
-            ? 0.8
-            : 1);
+    // Auto-fire or Manual-fire Tommy's lasers (and fused dual-core guns when docked!)
+    const manualTrigger =
+      this.manualFireHeld ||
+      this.keysHeld.has('KeyJ') ||
+      this.keysHeld.has('ControlLeft') ||
+      this.keysHeld.has('ControlRight') ||
+      this.keysHeld.has('Enter') ||
+      (this.pointerActive && this.flightSettings.touchMode === 'dual_stick');
+
+    if (!this.playerDowned && (this.flightSettings.autoFire || manualTrigger)) {
+      this.fireTimer -= dt;
+      if (this.fireTimer <= 0) {
+        this.firePlayerLasers(stats, manualTrigger);
+        this.fireTimer =
+          stats.fireInterval *
+          (this.selectedWeapon === 'plasma'
+            ? 1.65
+            : this.selectedWeapon === 'laser'
+              ? 0.8
+              : 1);
+      }
     }
 
     // Spawn tactical skirmish enemies in Episodes 1-9
     if (endlessMode || !epCfg.isBossEpisode) {
-      this.enemySpawnTimer -= dt;
-      if (
-        this.enemySpawnTimer <= 0 &&
-        this.enemies.length < epCfg.maxActiveEnemies
-      ) {
+      this.enemySpawnTimer -= worldDt;
+      const maxActive = epCfg.maxActiveEnemies + coopScale.maxEnemiesBonus;
+      if (this.enemySpawnTimer <= 0 && this.enemies.length < maxActive) {
         const spawnConfig = {
           ...epCfg,
           speedMultiplier:
@@ -1384,10 +1944,14 @@ export class WobGameEngine {
             (this.mode === 'daily' ? this.dailyChallenge.speedMultiplier : 1),
           hpMultiplier:
             epCfg.hpMultiplier *
+            coopScale.enemyHpMult *
             (this.mode === 'daily' ? this.dailyChallenge.enemyHealthMultiplier : 1),
         };
         this.spawnEpisodeEnemy(spawnConfig);
-        this.enemySpawnTimer = epCfg.spawnInterval * (0.85 + Math.random() * 0.3);
+        this.enemySpawnTimer =
+          epCfg.spawnInterval *
+          coopScale.spawnIntervalMult *
+          (0.85 + Math.random() * 0.3);
       }
     }
 
@@ -1401,15 +1965,15 @@ export class WobGameEngine {
       this.spawnOrb(ox, oy, 1 + Math.floor((this.chapter + this.episode) / 4));
     }
 
-    // Polly Partner Assist auto-trigger & combat update
+    // Polly Partner Assist + Twin Polly Drone update
     this.updatePollyPartner(dt, !endlessMode && epCfg.isBossEpisode);
 
     this.updateEnemies(
-      dt,
+      worldDt,
       epCfg.speedMultiplier *
         (this.mode === 'daily' ? this.dailyChallenge.speedMultiplier : 1),
     );
-    this.updateBullets(dt);
+    this.updateBullets(worldDt, dt);
     this.updateOrbs(dt, stats);
 
     // Throttled HUD update
@@ -1420,21 +1984,288 @@ export class WobGameEngine {
     }
   }
 
+  private updateCoopTeammate(
+    dt: number,
+    stats: ReturnType<typeof computePlayerStats>,
+  ): void {
+    if (!this.coopActive) return;
+
+    // Broadcast Tommy's telemetry to remote P2P partner
+    this.teammateNetSyncTimer -= dt;
+    if (this.teammateNetSyncTimer <= 0) {
+      this.teammateNetSyncTimer = 0.05;
+      coopSession.sendPacket({
+        type: 'pilot_state',
+        roomCode: this.coopRoomCode,
+        senderRole: this.coopRole,
+        state: {
+          x: this.playerX,
+          y: this.playerY,
+          vx: this.playerVx,
+          vy: this.playerVy,
+          angle: this.playerAngle,
+          hp: this.playerHp,
+          maxHp: stats.maxHp,
+          shield: this.playerShield,
+          maxShield: stats.maxShield,
+          downed: this.playerDowned,
+          firing: true,
+          skin: this.selectedShipSkin,
+          weapon: this.selectedWeapon,
+          callsign: 'TOMMY',
+        },
+      });
+    }
+
+    // Handle Revival Beacons between Tommy and Teammate
+    if (this.teammateDowned && !this.playerDowned) {
+      const dist = Math.hypot(this.playerX - this.teammateX, this.playerY - this.teammateY);
+      if (dist <= 115) {
+        this.teammateReviveProgress = Math.min(100, this.teammateReviveProgress + dt * 46);
+        if (this.teammateReviveProgress >= 100) {
+          this.teammateDowned = false;
+          this.teammateReviveProgress = 0;
+          this.teammateHp = Math.round(this.teammateMaxHp * 0.65);
+          this.teammateShield = this.teammateMaxShield;
+          soundFX.playReviveComplete();
+          this.emitParticles(this.teammateX, this.teammateY, '#a3ff12', 24, 220, 0.4, false);
+          this.spawnLabel(
+            this.teammateX,
+            this.teammateY - 28,
+            `${this.teammateCallsign} REVIVED!`,
+            '#a3ff12',
+          );
+        }
+      }
+      return;
+    }
+
+    if (this.playerDowned && !this.teammateDowned) {
+      // Teammate rushes to revive Tommy!
+      const dx = this.playerX - this.teammateX;
+      const dy = this.playerY - this.teammateY;
+      const dist = Math.hypot(dx, dy) || 1;
+      if (dist > 45) {
+        this.teammateVx = (dx / dist) * stats.moveSpeed * 1.1;
+        this.teammateVy = (dy / dist) * stats.moveSpeed * 1.1;
+        this.teammateX += this.teammateVx * dt;
+        this.teammateY += this.teammateVy * dt;
+      }
+      if (dist <= 115) {
+        this.playerReviveProgress = Math.min(100, this.playerReviveProgress + dt * 48);
+        if (this.playerReviveProgress >= 100) {
+          this.playerDowned = false;
+          this.playerReviveProgress = 0;
+          this.playerHp = Math.round(stats.maxHp * 0.65);
+          this.playerShield = stats.maxShield;
+          this.playerInvuln = 1.8;
+          soundFX.playReviveComplete();
+          this.emitParticles(this.playerX, this.playerY, '#00f5d4', 26, 240, 0.45, false);
+          this.spawnLabel(this.playerX, this.playerY - 28, 'TOMMY REVIVED!', '#00f5d4');
+        }
+      }
+    }
+
+    // If docked into Twin-Core Heavy Gunship, teammate locks onto Tommy's wing
+    if (this.squadronFusionDocked) {
+      this.teammateX = this.playerX;
+      this.teammateY = this.playerY + 18;
+      this.teammateAngle = this.playerAngle;
+    } else if (this.coopRole === 'dual_local') {
+      // Same-Device Dual-Control Co-op: IJKL keys control Pilot 2
+      let mx = 0;
+      let my = 0;
+      if (this.keysHeld.has('KeyI')) my -= 1;
+      if (this.keysHeld.has('KeyK')) my += 1;
+      if (this.keysHeld.has('KeyJ')) mx -= 1;
+      if (this.keysHeld.has('KeyL')) mx += 1;
+      if (mx !== 0 || my !== 0) {
+        const len = Math.hypot(mx, my);
+        this.teammateVx = (mx / len) * stats.moveSpeed;
+        this.teammateVy = (my / len) * stats.moveSpeed;
+      } else {
+        this.teammateVx *= 0.88;
+        this.teammateVy *= 0.88;
+      }
+      this.teammateX = Math.max(
+        24,
+        Math.min(this.width - 24, this.teammateX + this.teammateVx * dt),
+      );
+      this.teammateY = Math.max(
+        24,
+        Math.min(this.height - 24, this.teammateY + this.teammateVy * dt),
+      );
+    } else if (this.coopRole === 'ai_wingman' && !this.playerDowned) {
+      // Autonomous AI Squadron Wingman Formation & Combat Dodging
+      const orbitAng = this.titleTime * 1.1;
+      const desiredX = Math.max(
+        50,
+        Math.min(this.width - 50, this.playerX + Math.cos(orbitAng) * 135),
+      );
+      const desiredY = Math.max(
+        50,
+        Math.min(this.height - 50, this.playerY + Math.sin(orbitAng) * 110),
+      );
+      this.teammateVx = (desiredX - this.teammateX) * 3.8;
+      this.teammateVy = (desiredY - this.teammateY) * 3.8;
+      this.teammateX += this.teammateVx * dt;
+      this.teammateY += this.teammateVy * dt;
+    }
+
+    // Teammate weapon firing
+    const target = this.findHighestPriorityEnemy();
+    if (target) {
+      this.teammateAngle = Math.atan2(
+        target.y - this.teammateY,
+        target.x - this.teammateX,
+      );
+      this.teammateFireTimer -= dt;
+      if (this.teammateFireTimer <= 0 && !this.teammateDowned) {
+        this.teammateFireTimer = stats.fireInterval * 1.15;
+        this.fireTeammateWeapon(target);
+      }
+    }
+
+    // Passive / Active Squadron Energy Tether slicing enemies between Tommy and Teammate
+    const tetherDist = Math.hypot(
+      this.playerX - this.teammateX,
+      this.playerY - this.teammateY,
+    );
+    const tetherActive =
+      !this.playerDowned &&
+      !this.teammateDowned &&
+      !this.squadronFusionDocked &&
+      (this.squadronLinkActiveTimer > 0 || tetherDist <= SQUADRON_TETHER_MAX_DIST);
+
+    if (tetherActive) {
+      this.tetherDamageTickTimer -= dt;
+      if (this.tetherDamageTickTimer <= 0) {
+        this.tetherDamageTickTimer = 0.14;
+        const tetherDmg = Math.round(
+          (this.squadronLinkActiveTimer > 0 ? 26 : 14) *
+            (1 + this.roguePerks.tether_overdrive * 0.65),
+        );
+        for (const e of this.enemies) {
+          if (e.dyingTimer > 0) continue;
+          const distToBeam = this.pointToSegmentDist(
+            e.x,
+            e.y,
+            this.playerX,
+            this.playerY,
+            this.teammateX,
+            this.teammateY,
+          );
+          if (distToBeam <= e.radius + 10) {
+            e.hp -= tetherDmg;
+            e.hitFlash = 0.08;
+            this.emitParticles(e.x, e.y, '#00f5d4', 5, 150, 0.22, false);
+            if (e.hp <= 0) {
+              this.handleEnemyKilled(e);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private fireTeammateWeapon(target: Enemy): void {
+    const aimAngle = Math.atan2(target.y - this.teammateY, target.x - this.teammateX);
+    const skinCfg = getShipSkinConfig(this.teammateSkin);
+    const w = this.teammateWeapon;
+    const speed = w === 'plasma' ? 520 : w === 'homing' ? 580 : 740;
+    const dmg = w === 'plasma' ? 28 : w === 'laser' ? 20 : 15;
+    this.spawnBullet(
+      this.teammateX + Math.cos(aimAngle) * 16,
+      this.teammateY + Math.sin(aimAngle) * 16,
+      Math.cos(aimAngle) * speed,
+      Math.sin(aimAngle) * speed,
+      w === 'plasma' ? 5.5 : 4,
+      dmg,
+      1.5,
+      false,
+      skinCfg.hullColor,
+      w === 'homing',
+    );
+  }
+
   private updatePollyPartner(dt: number, isBossEpisode: boolean): void {
     const activeThreatCount = this.enemies.filter((e) => e.dyingTimer <= 0).length;
+    const haste = computePlayerStats(this.upgrades, this.hangarLevels).cooldownHaste ?? 1;
+
+    // Twin Polly Drone (always active once drafted via Rogue-Lite Perk!)
+    if (this.roguePerks.twin_polly > 0) {
+      const twinPhase = -this.titleTime * 2.4;
+      const tx = this.playerX + Math.cos(twinPhase) * 74;
+      const ty = this.playerY + Math.sin(twinPhase) * 64;
+      this.twinPollyX += (tx - this.twinPollyX) * Math.min(1, dt * 7);
+      this.twinPollyY += (ty - this.twinPollyY) * Math.min(1, dt * 7);
+      const twinTarget = this.findHighestPriorityEnemy();
+      if (twinTarget) {
+        this.twinPollyAngle = Math.atan2(
+          twinTarget.y - this.twinPollyY,
+          twinTarget.x - this.twinPollyX,
+        );
+        this.twinPollyFireTimer -= dt;
+        if (this.twinPollyFireTimer <= 0) {
+          this.twinPollyFireTimer = 0.34 / Math.max(1, this.roguePerks.twin_polly);
+          this.spawnBullet(
+            this.twinPollyX,
+            this.twinPollyY,
+            Math.cos(this.twinPollyAngle) * 780,
+            Math.sin(this.twinPollyAngle) * 780,
+            4.2,
+            14,
+            1.3,
+            false,
+            '#00f5d4',
+            true,
+          );
+        }
+      }
+    }
 
     if (this.pollyActiveTimer > 0) {
       this.pollyActiveTimer -= dt;
       this.pollyOrbitPhase += dt * 3.2;
 
-      const desiredX = this.playerX + Math.cos(this.pollyOrbitPhase) * 62;
-      const desiredY = this.playerY + Math.sin(this.pollyOrbitPhase) * 52;
+      // Polly Wingman Tactical AI: strafe boss weak points/subsystems during Starship Battles!
+      const boss = this.enemies.find((e) => e.kind === 'boss' && e.dyingTimer <= 0);
+      const activeSub = boss?.subsystems?.find((s) => !s.destroyed);
+
+      const desiredX = activeSub
+        ? activeSub.worldX + Math.cos(this.pollyOrbitPhase) * 88
+        : this.playerX + Math.cos(this.pollyOrbitPhase) * 62;
+      const desiredY = activeSub
+        ? activeSub.worldY + Math.sin(this.pollyOrbitPhase) * 72
+        : this.playerY + Math.sin(this.pollyOrbitPhase) * 52;
+
       this.pollyX += (desiredX - this.pollyX) * Math.min(1, dt * 7.5);
       this.pollyY += (desiredY - this.pollyY) * Math.min(1, dt * 7.5);
 
+      // Point-Defense Enemy Missile Interception!
+      this.pollyInterceptTimer -= dt;
+      if (this.pollyInterceptTimer <= 0) {
+        for (const b of this.bullets) {
+          if (b.active && b.fromEnemy) {
+            const d = Math.hypot(b.x - this.pollyX, b.y - this.pollyY);
+            if (d <= 135) {
+              b.active = false;
+              this.pollyInterceptTimer = 0.32;
+              this.pollyBeamTargetX = b.x;
+              this.pollyBeamTargetY = b.y;
+              this.pollyBeamFlashTimer = 0.08;
+              this.emitParticles(b.x, b.y, '#a3ff12', 6, 130, 0.2, false);
+              break;
+            }
+          }
+        }
+      }
+
       const target = this.findHighestPriorityEnemy();
       if (target) {
-        this.pollyAngle = Math.atan2(target.y - this.pollyY, target.x - this.pollyX);
+        const aimX = activeSub ? activeSub.worldX : target.x;
+        const aimY = activeSub ? activeSub.worldY : target.y;
+        this.pollyAngle = Math.atan2(aimY - this.pollyY, aimX - this.pollyX);
       } else {
         this.pollyAngle = this.playerAngle;
       }
@@ -1442,7 +2273,6 @@ export class WobGameEngine {
       this.pollyFireTimer -= dt;
       if (this.pollyFireTimer <= 0 && target) {
         this.pollyFireTimer = 0.22;
-        // Twin synchronized plasma beams + seeking salvo missile
         const perpX = -Math.sin(this.pollyAngle);
         const perpY = Math.cos(this.pollyAngle);
         for (const side of [-1, 1]) {
@@ -1460,17 +2290,31 @@ export class WobGameEngine {
           );
         }
 
-        // Direct synchronized beam strike pulse onto target
-        this.pollyBeamTargetX = target.x;
-        this.pollyBeamTargetY = target.y;
+        // Direct synchronized beam strike onto subsystem or enemy target
+        this.pollyBeamTargetX = activeSub ? activeSub.worldX : target.x;
+        this.pollyBeamTargetY = activeSub ? activeSub.worldY : target.y;
         this.pollyBeamFlashTimer = 0.09;
-        target.hp -= 10;
-        target.hitFlash = 0.08;
+
+        if (activeSub && boss) {
+          this.damageBossSubsystem(boss, activeSub, 14);
+        } else {
+          target.hp -= 10;
+          target.hitFlash = 0.08;
+        }
+
         if (target.shielded && (target.shieldOpenTimer ?? 0) <= 0) {
           target.shieldOpenTimer = 2.4;
           this.spawnLabel(target.x, target.y - target.radius, 'SHIELD BROKEN', '#38bdf8');
         }
-        this.emitParticles(target.x, target.y, '#a3ff12', 5, 160, 0.2, false);
+        this.emitParticles(
+          this.pollyBeamTargetX,
+          this.pollyBeamTargetY,
+          '#a3ff12',
+          5,
+          160,
+          0.2,
+          false,
+        );
         if (target.hp <= 0) {
           this.handleEnemyKilled(target);
         }
@@ -1479,18 +2323,58 @@ export class WobGameEngine {
 
       if (this.pollyActiveTimer <= 0) {
         this.pollyActiveTimer = 0;
-        this.pollyCooldownTimer = POLLY_ASSIST_COOLDOWN;
+        this.pollyCooldownTimer = POLLY_ASSIST_COOLDOWN / haste;
         this.emitParticles(this.pollyX, this.pollyY, '#38bdf8', 12, 160, 0.3, false);
       }
       return;
     }
 
-    this.pollyCooldownTimer = Math.max(0, this.pollyCooldownTimer - dt);
+    this.pollyCooldownTimer = Math.max(0, this.pollyCooldownTimer - dt * haste);
     if (this.pollyCooldownTimer <= 0) {
       const peakDensity = activeThreatCount >= POLLY_AUTO_ENEMY_THRESHOLD;
       const bossAssistReady = isBossEpisode && this.bossFightElapsed >= 3.0;
       if (peakDensity || bossAssistReady) {
         this.triggerPollyAssist(true);
+      }
+    }
+  }
+
+  private damageBossSubsystem(boss: Enemy, sub: BossSubsystem, damage: number): void {
+    if (sub.destroyed) return;
+    sub.hp = Math.max(0, sub.hp - damage);
+    sub.hitFlash = 0.12;
+    boss.hp = Math.max(1, boss.hp - damage * 0.85);
+    boss.hitFlash = 0.07;
+
+    if (sub.hp <= 0) {
+      sub.destroyed = true;
+      soundFX.playSubsystemDestroyed();
+      this.addTrauma(0.45);
+      this.emitParticles(sub.worldX, sub.worldY, '#ff6b35', 28, 260, 0.55, true);
+      this.spawnLabel(
+        sub.worldX,
+        sub.worldY - 18,
+        `DESTROYED: ${sub.name.toUpperCase()}`,
+        '#a3ff12',
+      );
+      this.spawnOrb(sub.worldX, sub.worldY, 6);
+
+      // Destroying subsystems disables or weakens boss systems!
+      if (sub.kind === 'shield_gen') {
+        boss.shielded = false;
+      } else if (sub.kind === 'laser_battery') {
+        boss.laserCount = Math.max(1, (boss.laserCount ?? 2) - 1);
+        boss.laserActiveTimer = 0;
+      } else if (sub.kind === 'missile_pod') {
+        boss.spiralSpokes = Math.max(5, Math.floor((boss.spiralSpokes ?? 12) * 0.55));
+      } else if (sub.kind === 'central_core') {
+        const coreBlast = Math.round(boss.maxHp * 0.18);
+        boss.hp -= coreBlast;
+        this.spawnLabel(boss.x, boss.y - boss.radius, `CORE OVERLOAD -${coreBlast}!`, '#ff007f');
+      }
+
+      if (boss.hp <= 0) {
+        this.handleEnemyKilled(boss);
       }
     }
   }
@@ -1515,6 +2399,59 @@ export class WobGameEngine {
     return bossCandidate ?? nearest;
   }
 
+  private pollGamepad(): {
+    gx: number;
+    gy: number;
+    gz: number;
+    aimX: number;
+    aimY: number;
+    firing: boolean;
+  } {
+    const empty = { gx: 0, gy: 0, gz: 0, aimX: 0, aimY: 0, firing: false };
+    if (typeof navigator === 'undefined' || typeof navigator.getGamepads !== 'function') {
+      return empty;
+    }
+    try {
+      const pads = navigator.getGamepads();
+      const gp = pads ? Array.from(pads).find((p) => p && p.connected) : null;
+      this.gamepadConnected = Boolean(gp);
+      if (!gp) return empty;
+
+      const deadzone = (val: number) => (Math.abs(val) < 0.16 ? 0 : val);
+      let gx = deadzone(gp.axes[0] ?? 0);
+      let gy = deadzone(gp.axes[1] ?? 0);
+      const aimX = deadzone(gp.axes[2] ?? 0);
+      const aimY = deadzone(gp.axes[3] ?? 0);
+
+      // D-Pad fallback for Left/Right/Front/Back
+      if (gp.buttons[14]?.pressed) gx = -1;
+      if (gp.buttons[15]?.pressed) gx = 1;
+      if (gp.buttons[12]?.pressed) gy = -1;
+      if (gp.buttons[13]?.pressed) gy = 1;
+
+      // Altitude Up/Down via Right Stick Y or Triggers LT (6) / RT (7)
+      let gz = -aimY;
+      if (gp.buttons[6]?.pressed && !gp.buttons[7]?.pressed) gz = -1;
+
+      const pressed = gp.buttons.map((b) => Boolean(b?.pressed));
+      const justPressed = (idx: number) =>
+        Boolean(pressed[idx] && !this.gamepadPrevButtons[idx]);
+
+      if (justPressed(1)) this.triggerDash(); // B / Circle
+      if (justPressed(2)) this.activateTacticalShield(); // X / Square
+      if (justPressed(3)) this.triggerPollyAssist(false); // Y / Triangle
+      if (justPressed(4)) this.triggerEmp(); // LB / L1
+      if (justPressed(5)) this.triggerSquadronLink(true); // RB / R1
+      if (justPressed(9)) this.pauseGame(); // Start
+
+      this.gamepadPrevButtons = pressed;
+      const firing = Boolean(gp.buttons[0]?.pressed || gp.buttons[7]?.pressed);
+      return { gx, gy, gz, aimX, aimY, firing };
+    } catch {
+      return empty;
+    }
+  }
+
   private updatePlayer(
     dt: number,
     stats: ReturnType<typeof computePlayerStats>,
@@ -1522,6 +2459,13 @@ export class WobGameEngine {
     this.playerInvuln = Math.max(0, this.playerInvuln - dt);
     this.dashCooldownTimer = Math.max(0, this.dashCooldownTimer - dt);
     this.dashBufferTimer = Math.max(0, this.dashBufferTimer - dt);
+
+    if (this.playerDowned) {
+      this.playerVx = 0;
+      this.playerVy = 0;
+      this.playerVz = 0;
+      return;
+    }
 
     if (stats.maxShield > 0 && this.playerShield < stats.maxShield) {
       this.shieldRegenTimer -= dt;
@@ -1536,40 +2480,88 @@ export class WobGameEngine {
     this.playerScaleX += (1 - this.playerScaleX) * Math.min(1, dt * 14);
     this.playerScaleY += (1 - this.playerScaleY) * Math.min(1, dt * 14);
 
-    // Movement: Arrow keys, W/A/D (KeyS is reserved for Tactical Shield), or Mouse/Touch Drag
+    const gp = this.pollGamepad();
+    if (gp.firing) {
+      this.manualFireHeld = true;
+    }
+
+    // 100% Full Manual 6-Direction Flight Input:
+    // Front (-Y), Back (+Y), Left (-X), Right (+X), Up (+Z), Down (-Z)
     let ix = 0;
     let iy = 0;
+    let iz = 0;
+
     if (this.keysHeld.has('KeyW') || this.keysHeld.has('ArrowUp')) iy -= 1;
-    if (this.keysHeld.has('ArrowDown')) iy += 1;
+    if (this.keysHeld.has('KeyS') || this.keysHeld.has('ArrowDown')) iy += 1;
     if (this.keysHeld.has('KeyA') || this.keysHeld.has('ArrowLeft')) ix -= 1;
     if (this.keysHeld.has('KeyD') || this.keysHeld.has('ArrowRight')) ix += 1;
 
+    // 3D Elevation Up (+Z) / Down (-Z) keys
+    const altMode = this.flightSettings.altitudeKeys;
+    const upKeyHeld =
+      this.keysHeld.has('PageUp') ||
+      this.keysHeld.has('KeyR') ||
+      (altMode === 'space_shift' && this.keysHeld.has('Space')) ||
+      (altMode === 'q_e' && this.keysHeld.has('KeyQ'));
+    const downKeyHeld =
+      this.keysHeld.has('PageDown') ||
+      this.keysHeld.has('KeyF') ||
+      (altMode === 'space_shift' &&
+        (this.keysHeld.has('ShiftLeft') || this.keysHeld.has('ShiftRight'))) ||
+      (altMode === 'q_e' && this.keysHeld.has('KeyE'));
+
+    if (upKeyHeld) iz += 1;
+    if (downKeyHeld) iz -= 1;
+
+    // Combine with Virtual Analog Thumbstick, Vertical Altitude Touch Slider, or Gamepad
     if (ix !== 0 || iy !== 0) {
       const len = Math.hypot(ix, iy);
       ix /= len;
       iy /= len;
-    } else if (this.pointerActive) {
+    } else if (this.joystickActive) {
+      ix = this.joystickDx;
+      iy = this.joystickDy;
+    } else if (Math.hypot(gp.gx, gp.gy) > 0.05) {
+      ix = gp.gx;
+      iy = gp.gy;
+    } else if (
+      this.pointerActive &&
+      this.flightSettings.touchMode === 'direct_touch'
+    ) {
+      // 1:1 Direct Finger Tracking mode (with tight deadzone so ship holds position once reached)
       const dx = this.pointerWorldX - this.playerX;
       const dy = this.pointerWorldY - this.playerY;
       const dist = Math.hypot(dx, dy);
-      if (dist > 10) {
-        ix = dx / dist;
-        iy = dy / dist;
+      if (dist > 6) {
+        const factor = Math.min(1, dist / 28);
+        ix = (dx / dist) * factor;
+        iy = (dy / dist) * factor;
+      }
+    }
+
+    if (iz === 0) {
+      if (Math.abs(this.altitudeTouchInput) > 0.05) {
+        iz = this.altitudeTouchInput;
+      } else if (Math.abs(gp.gz) > 0.1) {
+        iz = gp.gz;
       }
     }
 
     if (this.dashBufferTimer > 0 && this.dashCooldownTimer <= 0 && this.dashTimer <= 0) {
       this.dashBufferTimer = 0;
-      this.dashTimer = 0.16;
+      this.dashTimer = this.dashDuration;
       this.dashCooldownTimer = stats.dashCooldown;
-      this.playerInvuln = Math.max(this.playerInvuln, 0.24);
+      this.playerInvuln = Math.max(this.playerInvuln, 0.28);
 
-      if (ix !== 0 || iy !== 0) {
-        this.dashDirX = ix;
-        this.dashDirY = iy;
+      if (ix !== 0 || iy !== 0 || iz !== 0) {
+        const len3 = Math.hypot(ix, iy) || 1;
+        this.dashDirX = ix / len3;
+        this.dashDirY = iy / len3;
+        this.dashDirZ = iz;
       } else {
         this.dashDirX = Math.cos(this.playerAngle);
         this.dashDirY = Math.sin(this.playerAngle);
+        this.dashDirZ = 0;
       }
 
       this.playerScaleX = 1.32;
@@ -1583,6 +2575,7 @@ export class WobGameEngine {
       const dashSpeed = stats.moveSpeed * 2.85;
       this.playerVx = this.dashDirX * dashSpeed;
       this.playerVy = this.dashDirY * dashSpeed;
+      this.playerVz = this.dashDirZ * (stats.moveSpeed * 1.4);
       this.afterimageSpawnTimer -= dt;
       if (this.afterimageSpawnTimer <= 0) {
         this.afterimageSpawnTimer = 0.032;
@@ -1591,30 +2584,48 @@ export class WobGameEngine {
     } else {
       const targetVx = ix * stats.moveSpeed;
       const targetVy = iy * stats.moveSpeed;
-      const accel = ix !== 0 || iy !== 0 ? 18 : 13;
-      this.playerVx += (targetVx - this.playerVx) * Math.min(1, accel * dt);
-      this.playerVy += (targetVy - this.playerVy) * Math.min(1, accel * dt);
+      const targetVz = iz * (stats.moveSpeed * 0.78);
+      const dampRate = this.flightSettings.inertialDampening ? 26 : 12;
+
+      const accelXY = ix !== 0 || iy !== 0 ? 22 : dampRate;
+      const accelZ = iz !== 0 ? 20 : dampRate;
+
+      this.playerVx += (targetVx - this.playerVx) * Math.min(1, accelXY * dt);
+      this.playerVy += (targetVy - this.playerVy) * Math.min(1, accelXY * dt);
+      this.playerVz += (targetVz - this.playerVz) * Math.min(1, accelZ * dt);
+
+      // Crisp zero-drift lock when no directional input is held!
+      if (ix === 0 && Math.abs(this.playerVx) < 3.5) this.playerVx = 0;
+      if (iy === 0 && Math.abs(this.playerVy) < 3.5) this.playerVy = 0;
+      if (iz === 0 && Math.abs(this.playerVz) < 3.5) this.playerVz = 0;
     }
 
     this.playerX += this.playerVx * dt;
     this.playerY += this.playerVy * dt;
+    this.playerZ += this.playerVz * dt;
 
     const pad = this.playerRadius + 10;
     this.playerX = Math.max(pad, Math.min(this.width - pad, this.playerX));
     this.playerY = Math.max(pad, Math.min(this.height - pad, this.playerY));
+    this.playerZ = Math.max(
+      -ARENA_MAX_ALTITUDE,
+      Math.min(ARENA_MAX_ALTITUDE, this.playerZ),
+    );
 
     const nearest = this.findNearestEnemy(this.playerX, this.playerY);
-    if (nearest) {
-      this.playerAngle = Math.atan2(
-        nearest.y - this.playerY,
-        nearest.x - this.playerX,
-      );
+    if (Math.hypot(gp.aimX, gp.aimY) > 0.25) {
+      this.playerAngle = Math.atan2(gp.aimY, gp.aimX);
     } else if (this.pointerActive) {
       this.playerAngle = Math.atan2(
         this.pointerWorldY - this.playerY,
         this.pointerWorldX - this.playerX,
       );
-    } else if (Math.hypot(this.playerVx, this.playerVy) > 25) {
+    } else if (nearest) {
+      this.playerAngle = Math.atan2(
+        nearest.y - this.playerY,
+        nearest.x - this.playerX,
+      );
+    } else if (Math.hypot(this.playerVx, this.playerVy) > 15) {
       this.playerAngle = Math.atan2(this.playerVy, this.playerVx);
     }
   }
@@ -1635,10 +2646,18 @@ export class WobGameEngine {
     return best;
   }
 
-  private firePlayerLasers(stats: ReturnType<typeof computePlayerStats>): void {
+  private firePlayerLasers(
+    stats: ReturnType<typeof computePlayerStats>,
+    forceManualFire = false,
+  ): void {
     const target = this.findNearestEnemy(this.playerX, this.playerY);
     let aimAngle = this.playerAngle;
-    if (target) {
+    if (this.pointerActive && this.flightSettings.touchMode === 'dual_stick') {
+      aimAngle = Math.atan2(
+        this.pointerWorldY - this.playerY,
+        this.pointerWorldX - this.playerX,
+      );
+    } else if (target) {
       aimAngle = Math.atan2(target.y - this.playerY, target.x - this.playerX);
     } else if (this.pointerActive) {
       aimAngle = Math.atan2(
@@ -1646,10 +2665,15 @@ export class WobGameEngine {
         this.pointerWorldX - this.playerX,
       );
     } else {
-      if (this.enemies.length === 0) return;
+      if (this.enemies.length === 0 && !forceManualFire) return;
     }
 
-    const count = stats.shotCount;
+    const dmgMult =
+      (stats.damageMultiplier ?? 1) *
+      (this.squadronFusionDocked ? 1.45 : 1) *
+      (this.focusCoreBuffTimer > 0 ? 1.25 : 1);
+
+    const count = stats.shotCount + (this.squadronFusionDocked ? 1 : 0);
     const spreadStep = this.selectedWeapon === 'spread' ? 0.11 : 0.035;
     const speed =
       this.selectedWeapon === 'plasma'
@@ -1657,7 +2681,7 @@ export class WobGameEngine {
         : this.selectedWeapon === 'homing'
           ? 560
           : 760;
-    const damage =
+    const baseDamage =
       this.selectedWeapon === 'plasma'
         ? 34
         : this.selectedWeapon === 'laser'
@@ -1665,7 +2689,9 @@ export class WobGameEngine {
           : this.selectedWeapon === 'homing'
             ? 15
             : 18;
-    const radius = this.selectedWeapon === 'plasma' ? 6 : this.selectedWeapon === 'laser' ? 3 : 4.2;
+    const damage = Math.round(baseDamage * dmgMult);
+    const radius =
+      this.selectedWeapon === 'plasma' ? 6 : this.selectedWeapon === 'laser' ? 3 : 4.2;
     const life = this.selectedWeapon === 'plasma' ? 2 : 1.4;
     const perpX = -Math.sin(aimAngle);
     const perpY = Math.cos(aimAngle);
@@ -1697,9 +2723,14 @@ export class WobGameEngine {
       );
     }
 
+    // Twin-Core Heavy Gunship Fusion simultaneously fires the Teammate's weapon!
+    if (this.squadronFusionDocked && target) {
+      this.fireTeammateWeapon(target);
+    }
+
     this.playerScaleX = 0.92;
     this.playerScaleY = 1.08;
-    soundFX.playLaser(count);
+    soundFX.playLaser(count, this.selectedWeapon);
   }
 
   private spawnEpisodeEnemy(
@@ -1863,6 +2894,7 @@ export class WobGameEngine {
       }
       if (
         this.playerInvuln <= 0 &&
+        !this.playerDowned &&
         circleIntersects(
           this.playerX,
           this.playerY,
@@ -1890,6 +2922,9 @@ export class WobGameEngine {
       const e = this.enemies[i];
       e.hitFlash = Math.max(0, e.hitFlash - dt);
       e.shieldOpenTimer = Math.max(0, (e.shieldOpenTimer ?? 0) - dt);
+      if (e.warpInTimer && e.warpInTimer > 0) {
+        e.warpInTimer = Math.max(0, e.warpInTimer - dt);
+      }
 
       if (e.dyingTimer > 0) {
         e.dyingTimer -= dt;
@@ -1898,6 +2933,18 @@ export class WobGameEngine {
           this.enemies.splice(i, 1);
         }
         continue;
+      }
+
+      if (e.kind === 'boss') {
+        this.updateBossSubsystemPositions(e);
+        // Emit sparks & smoke from destroyed subsystems!
+        if (e.subsystems && Math.random() < 0.35) {
+          for (const sub of e.subsystems) {
+            if (sub.destroyed && Math.random() < 0.4) {
+              this.emitParticles(sub.worldX, sub.worldY, '#ff6b35', 1, 55, 0.25, true);
+            }
+          }
+        }
       }
 
       if (e.stunTimer > 0) {
@@ -2033,8 +3080,14 @@ export class WobGameEngine {
           soundFX.playBossAlert();
         }
 
+        const laserDestroyed = e.subsystems?.some(
+          (s) => s.kind === 'laser_battery' && s.destroyed,
+        );
+        const missileDestroyed = e.subsystems?.some(
+          (s) => s.kind === 'missile_pod' && s.destroyed,
+        );
+
         if (!archetype) {
-          // Sub-boss Gatekeeper
           if (e.state === 'approach') {
             const desiredDist = 240;
             if (dist > desiredDist) {
@@ -2056,7 +3109,7 @@ export class WobGameEngine {
             e.vy *= 0.92;
             e.stateTimer -= dt;
             if (e.stateTimer <= 0) {
-              const spokes = 10;
+              const spokes = missileDestroyed ? 5 : 10;
               for (let b = 0; b < spokes; b++) {
                 const ang = e.aimAngle + (b / spokes) * Math.PI * 2;
                 this.spawnBullet(
@@ -2077,7 +3130,6 @@ export class WobGameEngine {
             }
           }
         } else if (archetype === 'sentinel' || archetype === 'leviathan') {
-          // Gigantic Chapter Boss: Sweeping Laser Arrays + Spiral Barrage + Drone Drops
           if (e.state === 'approach') {
             const desiredDist = 245;
             if (dist > desiredDist) {
@@ -2100,8 +3152,8 @@ export class WobGameEngine {
             e.vy *= 0.88;
             e.stateTimer -= dt;
             if (e.stateTimer <= 0) {
-              const phase = e.attackPhase ?? 0;
-              if (phase % 2 === 0) {
+              const phaseNum = e.attackPhase ?? 0;
+              if (phaseNum % 2 === 0 && !laserDestroyed) {
                 e.state = 'attack';
                 e.laserActiveTimer = 1.85;
                 e.stateTimer = 1.85;
@@ -2110,7 +3162,9 @@ export class WobGameEngine {
                 if (archetype === 'leviathan') {
                   this.spawnBossDataDrones(e, Math.max(2, e.droneCount ?? 2));
                 }
-                const spokes = e.spiralSpokes ?? 12;
+                const spokes = missileDestroyed
+                  ? Math.max(5, Math.floor((e.spiralSpokes ?? 12) * 0.5))
+                  : (e.spiralSpokes ?? 12);
                 for (let b = 0; b < spokes; b++) {
                   const ang = e.aimAngle + (b / spokes) * Math.PI * 2;
                   this.spawnBullet(
@@ -2126,7 +3180,7 @@ export class WobGameEngine {
                   );
                 }
                 this.emitParticles(e.x, e.y, '#ff007f', 22, 230, 0.38, true);
-                e.attackPhase = phase + 1;
+                e.attackPhase = phaseNum + 1;
                 e.state = 'approach';
                 e.stateTimer = Math.max(0.85, 1.4 / aggro);
               }
@@ -2140,7 +3194,7 @@ export class WobGameEngine {
             e.laserActiveTimer = Math.max(0, (e.laserActiveTimer ?? 0) - dt);
             e.stateTimer -= dt;
 
-            if (this.playerInvuln <= 0 && (e.laserActiveTimer ?? 0) > 0) {
+            if (this.playerInvuln <= 0 && !this.playerDowned && (e.laserActiveTimer ?? 0) > 0) {
               const beamLen = 820;
               for (let k = 0; k < beams; k++) {
                 const ang = (e.laserAngle ?? 0) + (k / beams) * Math.PI * 2;
@@ -2174,7 +3228,6 @@ export class WobGameEngine {
             }
           }
         } else if (archetype === 'helix') {
-          // Chapter 2+ Gigantic Boss: Bullet-Hell Spiral Rings + Minion Pressure
           if (e.state === 'approach') {
             const desiredDist = 230;
             if (dist > desiredDist) {
@@ -2200,7 +3253,7 @@ export class WobGameEngine {
                 this.spawnBossDataDrones(e, Math.max(2, e.droneCount ?? 2));
               }
               e.state = 'attack';
-              e.spiralTicksRemaining = 10;
+              e.spiralTicksRemaining = missileDestroyed ? 5 : 10;
               e.spiralTickTimer = 0;
               e.stateTimer = 1.7;
             }
@@ -2211,10 +3264,10 @@ export class WobGameEngine {
             if ((e.spiralTickTimer ?? 0) <= 0 && (e.spiralTicksRemaining ?? 0) > 0) {
               e.spiralTickTimer = 0.15;
               e.spiralTicksRemaining = (e.spiralTicksRemaining ?? 1) - 1;
-              const phase = e.attackPhase ?? 0;
-              const spinSign = phase % 2 === 0 ? 1 : -1;
+              const phaseNum = e.attackPhase ?? 0;
+              const spinSign = phaseNum % 2 === 0 ? 1 : -1;
               e.aimAngle += spinSign * 0.28;
-              const spokes = Math.max(8, Math.round((e.spiralSpokes ?? 10) * 0.8));
+              const spokes = Math.max(6, Math.round((e.spiralSpokes ?? 10) * 0.8));
               for (let b = 0; b < spokes; b++) {
                 const ang = e.aimAngle + (b / spokes) * Math.PI * 2;
                 this.spawnBullet(
@@ -2238,7 +3291,6 @@ export class WobGameEngine {
             }
           }
         } else {
-          // Chapter 3+ Gigantic Boss: Drone Fabricator + Heavy Fan Spread
           if (e.state === 'approach') {
             const desiredDist = 260;
             if (dist > desiredDist) {
@@ -2260,11 +3312,11 @@ export class WobGameEngine {
             e.vy *= 0.9;
             e.stateTimer -= dt;
             if (e.stateTimer <= 0) {
-              const phase = e.attackPhase ?? 0;
-              if (phase % 2 === 0) {
+              const phaseNum = e.attackPhase ?? 0;
+              if (phaseNum % 2 === 0) {
                 this.spawnBossDataDrones(e, e.droneCount ?? 3);
               }
-              const spreadCount = 9;
+              const spreadCount = missileDestroyed ? 5 : 9;
               for (let b = 0; b < spreadCount; b++) {
                 const offset = (b - (spreadCount - 1) / 2) * 0.16;
                 const ang = e.aimAngle + offset;
@@ -2281,7 +3333,7 @@ export class WobGameEngine {
                 );
               }
               this.emitParticles(e.x, e.y, '#ff6b35', 18, 210, 0.34, true);
-              e.attackPhase = phase + 1;
+              e.attackPhase = phaseNum + 1;
               e.state = 'approach';
               e.stateTimer = Math.max(0.95, 1.65 / aggro);
             }
@@ -2312,13 +3364,17 @@ export class WobGameEngine {
         }
       }
 
-      // Contact collision with Tommy (or active Tactical Shield counter-shock!)
-      const activeShieldRadius =
-        this.tacticalShieldActiveTimer > 0
-          ? this.playerRadius + 16
-          : this.playerRadius;
+      // Contact collision with Tommy (or active Tactical Shield / Twin-Core Gunship Shield)
+      const hasBarrier = this.tacticalShieldActiveTimer > 0 || this.squadronFusionDocked;
+      const activeShieldRadius = hasBarrier
+        ? this.playerRadius + (this.squadronFusionDocked ? 24 : 16)
+        : this.playerRadius;
+
+      const altitudeClearOfEnemy = Math.abs(this.playerZ - (e.z ?? 0)) > 68;
 
       if (
+        !this.playerDowned &&
+        !altitudeClearOfEnemy &&
         circleIntersects(
           this.playerX,
           this.playerY,
@@ -2328,8 +3384,7 @@ export class WobGameEngine {
           e.radius,
         )
       ) {
-        if (this.tacticalShieldActiveTimer > 0) {
-          // Tactical Shield absorbs contact & reflects a shock knockback + counter-damage
+        if (hasBarrier) {
           const awayX = e.x - this.playerX;
           const awayY = e.y - this.playerY;
           const awayLen = Math.hypot(awayX, awayY) || 1;
@@ -2352,13 +3407,14 @@ export class WobGameEngine {
     }
   }
 
-  private updateBullets(dt: number): void {
-    const shieldRadius = this.playerRadius + 16;
+  private updateBullets(enemyDt: number, playerDt: number): void {
+    const shieldRadius = this.playerRadius + (this.squadronFusionDocked ? 24 : 16);
+    const hasBarrier = this.tacticalShieldActiveTimer > 0 || this.squadronFusionDocked;
 
     for (const b of this.bullets) {
       if (!b.active) continue;
+      const stepDt = b.fromEnemy ? enemyDt : playerDt;
 
-      // Slight homing curve for Polly's salvo missiles
       if (!b.fromEnemy && b.homing) {
         const nearest = this.findNearestEnemy(b.x, b.y);
         if (nearest) {
@@ -2368,15 +3424,15 @@ export class WobGameEngine {
           let diff = desiredAngle - curAngle;
           while (diff > Math.PI) diff -= Math.PI * 2;
           while (diff < -Math.PI) diff += Math.PI * 2;
-          const nextAngle = curAngle + diff * Math.min(1, dt * 6);
+          const nextAngle = curAngle + diff * Math.min(1, stepDt * 6);
           b.vx = Math.cos(nextAngle) * speed;
           b.vy = Math.sin(nextAngle) * speed;
         }
       }
 
-      b.x += b.vx * dt;
-      b.y += b.vy * dt;
-      b.life -= dt;
+      b.x += b.vx * stepDt;
+      b.y += b.vy * stepDt;
+      b.life -= stepDt;
 
       if (
         b.life <= 0 ||
@@ -2390,9 +3446,9 @@ export class WobGameEngine {
       }
 
       if (b.fromEnemy) {
-        // Tactical Shield reflects enemy bullets into lime counter-attacks!
+        // Tactical Shield or Twin-Core Fusion dome reflects enemy bullets!
         if (
-          this.tacticalShieldActiveTimer > 0 &&
+          hasBarrier &&
           circleIntersects(
             this.playerX,
             this.playerY,
@@ -2419,8 +3475,12 @@ export class WobGameEngine {
           continue;
         }
 
+        // Direct Hit on Tommy (unless Tommy ascended/descended clear in 3D altitude Z!)
+        const altDiff = Math.abs(this.playerZ - (b.z ?? 0));
         if (
+          !this.playerDowned &&
           this.playerInvuln <= 0 &&
+          altDiff <= 56 &&
           circleIntersects(
             this.playerX,
             this.playerY,
@@ -2432,10 +3492,59 @@ export class WobGameEngine {
         ) {
           b.active = false;
           this.damagePlayer(b.damage, b.x, b.y);
+          continue;
+        }
+
+        // Near-Miss Graze Detection (in XY or 3D Altitude Z flyover/underpass)!
+        if (
+          !b.grazed &&
+          !this.playerDowned &&
+          altDiff <= 85 &&
+          circleIntersects(
+            this.playerX,
+            this.playerY,
+            this.playerRadius + 22,
+            b.x,
+            b.y,
+            b.radius,
+          )
+        ) {
+          b.grazed = true;
+          this.grazeCount += 1;
+          const hyper = 1 + this.roguePerks.hyper_graze;
+          this.grazeSlowMoTimer = Math.max(this.grazeSlowMoTimer, 0.32 * hyper);
+          this.dashCooldownTimer = Math.max(0, this.dashCooldownTimer - 0.45 * hyper);
+          this.empCooldownTimer = Math.max(0, this.empCooldownTimer - 1.1 * hyper);
+          const grazeBonus = 50 * this.comboMultiplier;
+          this.score += grazeBonus;
+          soundFX.playGraze();
+          this.emitParticles(this.playerX, this.playerY, '#fbbf24', 5, 110, 0.2, false);
+          this.spawnLabel(
+            this.playerX,
+            this.playerY - 26,
+            `GRAZE +${grazeBonus}`,
+            '#fbbf24',
+          );
         }
       } else {
         for (const e of this.enemies) {
           if (e.dyingTimer > 0) continue;
+
+          // First check if projectile hits any active Capital Starship Destructible Subsystem!
+          let subsystemHit = false;
+          if (e.kind === 'boss' && e.subsystems) {
+            for (const sub of e.subsystems) {
+              if (!sub.destroyed && circleIntersects(b.x, b.y, b.radius + 4, sub.worldX, sub.worldY, 16)) {
+                b.active = false;
+                subsystemHit = true;
+                this.damageBossSubsystem(e, sub, b.damage * 1.25);
+                this.emitParticles(b.x, b.y, '#a3ff12', 6, 160, 0.22, true);
+                break;
+              }
+            }
+          }
+          if (subsystemHit) break;
+
           if (circleIntersects(b.x, b.y, b.radius, e.x, e.y, e.radius)) {
             b.active = false;
             if (e.shielded && (e.shieldOpenTimer ?? 0) <= 0) {
@@ -2457,6 +3566,11 @@ export class WobGameEngine {
               this.spawnLabel(e.x, e.y - e.radius - 8, 'WEAK POINT', '#a3ff12');
             }
 
+            // Chain-Lightning Rogue-Lite Perk Arc
+            if (this.roguePerks.chain_lightning > 0) {
+              this.triggerChainLightning(e, b.damage);
+            }
+
             if (e.hp <= 0) {
               this.handleEnemyKilled(e);
             } else {
@@ -2469,11 +3583,51 @@ export class WobGameEngine {
     }
   }
 
+  private triggerChainLightning(sourceEnemy: Enemy, baseDamage: number): void {
+    const stacks = this.roguePerks.chain_lightning;
+    if (stacks <= 0) return;
+    const arcDamage = Math.round(baseDamage * 0.45 * stacks);
+    let arcsRemaining = Math.min(3, stacks + 1);
+    for (const other of this.enemies) {
+      if (other === sourceEnemy || other.dyingTimer > 0) continue;
+      const dist = Math.hypot(other.x - sourceEnemy.x, other.y - sourceEnemy.y);
+      if (dist <= 190) {
+        other.hp -= arcDamage;
+        other.hitFlash = 0.08;
+        this.lightningArcs.push({
+          x1: sourceEnemy.x,
+          y1: sourceEnemy.y,
+          x2: other.x,
+          y2: other.y,
+          color: '#38bdf8',
+          life: 0.12,
+        });
+        if (other.hp <= 0) {
+          this.handleEnemyKilled(other);
+        }
+        arcsRemaining--;
+        if (arcsRemaining <= 0) break;
+      }
+    }
+  }
+
   private handleEnemyKilled(enemy: Enemy): void {
     if (enemy.dyingTimer > 0) return;
     enemy.dyingTimer = 0.22;
     enemy.hitFlash = 0.22;
     this.enemiesDefeated += 1;
+
+    // Vampiric Shield Recharge Rogue-Lite Perk
+    if (this.roguePerks.vampiric_shield > 0 && this.enemiesDefeated % 3 === 0) {
+      const stats = computePlayerStats(this.upgrades, this.hangarLevels);
+      const stacks = this.roguePerks.vampiric_shield;
+      this.playerShield = Math.min(
+        Math.max(30, stats.maxShield),
+        this.playerShield + 8 * stacks,
+      );
+      this.playerHp = Math.min(stats.maxHp, this.playerHp + 4 * stacks);
+      this.spawnLabel(this.playerX, this.playerY - 22, '+SIPHON SHIELD', '#a3ff12');
+    }
 
     const streakNext = advanceComboStreak(this.comboCount);
     this.comboCount = streakNext.streak;
@@ -2496,6 +3650,8 @@ export class WobGameEngine {
     const isBoss = enemy.kind === 'boss';
     if (isBoss) {
       this.bossesDefeated += 1;
+      // Award Hangar Scrap for defeating bosses!
+      this.awardHangarScrap(enemy.isChapterBoss ? 25 : 12);
     }
     soundFX.playExplosion(isBoss);
     this.hitstopTimer = isBoss ? 0.075 : 0.032;
@@ -2550,6 +3706,7 @@ export class WobGameEngine {
       this.chaptersCleared += 1;
       this.shards += 12 + this.chapter * 4;
       this.totalShardsCollected += 12 + this.chapter * 4;
+      this.prepareMidRunDraft();
       soundFX.playChapterVictory();
       this.recordAchievementProgress({
         enemiesDefeated: 1,
@@ -2570,6 +3727,36 @@ export class WobGameEngine {
     this.pushHudSnapshot();
   }
 
+  private awardHangarScrap(amount: number): void {
+    if (amount <= 0) return;
+    const hangar = loadHangarState();
+    const updated = {
+      ...hangar,
+      scrap: hangar.scrap + amount,
+    };
+    saveHangarState(updated);
+    void idbSet(HANGAR_STORAGE_KEY, updated);
+
+    const savedProg = loadSavedCampaignProgress();
+    const nextProg = {
+      highestChapter: Math.max(savedProg.highestChapter, this.chapter),
+      lastChapter: this.chapter,
+      lastEpisode: this.episode,
+      bankedShards: updated.scrap,
+    };
+    saveCampaignProgress(nextProg);
+    void idbSet(CAMPAIGN_PROGRESS_STORAGE_KEY, nextProg);
+
+    this.callbacks.onHangarScrapEarned?.(amount);
+  }
+
+  private prepareMidRunDraft(): void {
+    this.draftPending = true;
+    this.draftChoices = pickRogueDraftChoices(
+      (this.chapter * 31 + this.episode * 17 + this.score) / 1000,
+    );
+  }
+
   public triggerEmp(): boolean {
     if (
       this.gameState !== 'playing' ||
@@ -2582,7 +3769,12 @@ export class WobGameEngine {
 
     soundFX.unlock();
     soundFX.playEmpBlast();
-    this.empCooldownTimer = EMP_COOLDOWN_SECONDS;
+    const overchargeStacks = this.roguePerks.overcharged_emp;
+    const haste = computePlayerStats(this.upgrades, this.hangarLevels).cooldownHaste ?? 1;
+    this.empCooldownTimer = Math.max(
+      10,
+      (EMP_COOLDOWN_SECONDS - overchargeStacks * 4) / haste,
+    );
     this.empWaveActive = true;
     this.empWaveX = this.playerX;
     this.empWaveY = this.playerY;
@@ -2603,6 +3795,9 @@ export class WobGameEngine {
       }
     }
 
+    const effectiveRadius = EMP_BLAST_RADIUS * (1 + overchargeStacks * 0.35);
+    const effectiveDamage = Math.round(EMP_BLAST_DAMAGE * (1 + overchargeStacks * 0.55));
+
     for (const e of this.enemies) {
       if (e.dyingTimer > 0) continue;
 
@@ -2617,8 +3812,9 @@ export class WobGameEngine {
       }
 
       const dist = Math.hypot(e.x - this.playerX, e.y - this.playerY);
-      if (dist <= EMP_BLAST_RADIUS) {
-        const dmg = e.kind === 'block' ? EMP_BLAST_DAMAGE : Math.round(EMP_BLAST_DAMAGE * 0.7);
+      if (dist <= effectiveRadius) {
+        const dmg =
+          e.kind === 'block' ? effectiveDamage : Math.round(effectiveDamage * 0.7);
         e.hp -= dmg;
         e.hitFlash = 0.14;
         this.emitParticles(e.x, e.y, '#38bdf8', 8, 170, 0.3, true);
@@ -2638,8 +3834,8 @@ export class WobGameEngine {
     sourceY: number,
     attackerTitle?: string,
   ): void {
-    // Active Tactical Shield absorbs all damage cleanly!
-    if (this.tacticalShieldActiveTimer > 0) {
+    // Active Tactical Shield or Twin-Core Fusion Dome absorbs all damage cleanly!
+    if (this.tacticalShieldActiveTimer > 0 || this.squadronFusionDocked) {
       this.tacticalShieldPulse = 1;
       soundFX.playShieldReflect();
       this.emitParticles(this.playerX, this.playerY, '#00f5d4', 10, 180, 0.28, false);
@@ -2655,7 +3851,10 @@ export class WobGameEngine {
     this.episodeDamaged = true;
     this.playerHp = res.hp;
     this.playerShield = res.shield;
-    this.shieldRegenTimer = computePlayerStats(this.upgrades).shieldRegenDelay;
+    this.shieldRegenTimer = computePlayerStats(
+      this.upgrades,
+      this.hangarLevels,
+    ).shieldRegenDelay;
     this.playerInvuln = 0.85;
     this.playerHitFlash = 0.14;
     this.hitstopTimer = 0.055;
@@ -2681,6 +3880,19 @@ export class WobGameEngine {
     this.pushHudSnapshot();
 
     if (res.lethal) {
+      // In Co-op mode, if Teammate is still alive, drop an emergency Revival Beacon!
+      if (this.coopActive && !this.teammateDowned) {
+        this.playerDowned = true;
+        this.playerReviveProgress = 0;
+        this.spawnLabel(
+          this.playerX,
+          this.playerY - 32,
+          'EMERGENCY BEACON · AWAITING REVIVE!',
+          '#ff2a5f',
+        );
+        return;
+      }
+
       this.lastDefeatBossName =
         attackerTitle ??
         this.enemies.find((e) => e.isChapterBoss)?.bossTitle ??
@@ -2695,6 +3907,18 @@ export class WobGameEngine {
   private finalizeGameOver(): void {
     this.isDyingSequence = false;
     this.highScore = saveHighScore(this.score);
+    const scrapEarned = Math.max(5, Math.round(this.totalShardsCollected * 0.4 + this.chapter * 6));
+    this.awardHangarScrap(scrapEarned);
+
+    if (this.mode === 'daily') {
+      recordDailyChallengeRun(
+        this.dailyChallenge.id,
+        this.score,
+        this.chapter,
+        this.episode,
+      );
+    }
+
     soundFX.playGameOver();
     this.syncBodyState('gameover');
     this.pushHudSnapshot();
@@ -2719,6 +3943,9 @@ export class WobGameEngine {
       shardsCollected: this.totalShardsCollected,
       maxCombo: this.maxCombo,
       survivalSeconds: this.totalSurvivalSeconds,
+      coopSquadron: this.coopActive,
+      scrapEarned,
+      grazeTotal: this.grazeCount,
     });
     this.callbacks.onGameOver(summary);
   }
@@ -2727,10 +3954,13 @@ export class WobGameEngine {
     if (!this.episodeDamaged) {
       this.recordAchievementProgress({ perfectEpisodesCleared: 1 });
     }
+    this.awardHangarScrap(4 + this.chapter * 2);
+    this.prepareMidRunDraft();
     soundFX.playWaveClear();
     this.keysHeld.clear();
     this.pointerActive = false;
-    const stats = computePlayerStats(this.upgrades);
+    this.joystickActive = false;
+    const stats = computePlayerStats(this.upgrades, this.hangarLevels);
     this.playerHp = Math.min(stats.maxHp, this.playerHp + 18);
     this.playerShield = stats.maxShield;
     this.syncBodyState('episode_clear');
@@ -2808,6 +4038,7 @@ export class WobGameEngine {
         b.fromEnemy = fromEnemy;
         b.color = color;
         b.homing = homing;
+        b.grazed = false;
         return;
       }
     }
@@ -2915,8 +4146,54 @@ export class WobGameEngine {
     this.trauma = Math.min(1, this.trauma + amount);
   }
 
+  private buildRadarBlips(): RadarBlip[] {
+    const blips: RadarBlip[] = [];
+    const halfW = Math.max(1, this.width * 0.5);
+    const halfH = Math.max(1, this.height * 0.5);
+    const maxZ = Math.max(1, ARENA_MAX_ALTITUDE);
+
+    if (this.coopActive) {
+      blips.push({
+        id: -1,
+        x: Math.max(-1, Math.min(1, (this.teammateX - this.playerX) / halfW)),
+        y: Math.max(-1, Math.min(1, (this.teammateY - this.playerY) / halfH)),
+        z: Math.max(-1, Math.min(1, (this.teammateZ - this.playerZ) / maxZ)),
+        kind: 'teammate',
+        label: this.teammateCallsign,
+      });
+    }
+
+    for (const e of this.enemies) {
+      if (e.dyingTimer > 0) continue;
+      blips.push({
+        id: e.id,
+        x: Math.max(-1, Math.min(1, (e.x - this.playerX) / halfW)),
+        y: Math.max(-1, Math.min(1, (e.y - this.playerY) / halfH)),
+        z: Math.max(-1, Math.min(1, ((e.z ?? 0) - this.playerZ) / maxZ)),
+        kind: e.kind,
+        isBoss: e.kind === 'boss',
+      });
+      if (e.kind === 'boss' && e.subsystems) {
+        for (let i = 0; i < e.subsystems.length; i++) {
+          const s = e.subsystems[i];
+          if (!s.destroyed) {
+            blips.push({
+              id: e.id * 100 + i,
+              x: Math.max(-1, Math.min(1, (s.worldX - this.playerX) / halfW)),
+              y: Math.max(-1, Math.min(1, (s.worldY - this.playerY) / halfH)),
+              z: Math.max(-1, Math.min(1, ((s.worldZ ?? 0) - this.playerZ) / maxZ)),
+              kind: 'subsystem',
+              label: s.name,
+            });
+          }
+        }
+      }
+    }
+    return blips.slice(0, 28);
+  }
+
   private pushHudSnapshot(): void {
-    const stats = computePlayerStats(this.upgrades);
+    const stats = computePlayerStats(this.upgrades, this.hangarLevels);
     const boss = this.enemies.find((e) => e.kind === 'boss' && e.dyingTimer <= 0);
     const dashReadyRatio =
       stats.dashCooldown > 0
@@ -2929,6 +4206,16 @@ export class WobGameEngine {
         : this.pollyCooldownTimer > 0
           ? 'cooldown'
           : 'ready';
+
+    const tetherDist = Math.hypot(
+      this.playerX - this.teammateX,
+      this.playerY - this.teammateY,
+    );
+    const linkActive =
+      this.coopActive &&
+      !this.teammateDowned &&
+      !this.playerDowned &&
+      (this.squadronLinkActiveTimer > 0 || tetherDist <= SQUADRON_TETHER_MAX_DIST);
 
     this.callbacks.onHudUpdate({
       mode: this.mode,
@@ -2979,8 +4266,57 @@ export class WobGameEngine {
       bossHp: boss ? Math.max(0, Math.round(boss.hp)) : 0,
       bossMaxHp: boss ? Math.round(boss.maxHp) : 1,
       bossName: boss?.bossTitle ?? computeChapterBossConfig(this.chapter).title,
+      bossSubsystems: boss?.subsystems ? [...boss.subsystems] : undefined,
       upgrades: { ...this.upgrades },
       muted: soundFX.isMuted(),
+      playerX: Math.round(this.playerX),
+      playerY: Math.round(this.playerY),
+      playerZ: Math.round(this.playerZ),
+      playerVx: Math.round(this.playerVx),
+      playerVy: Math.round(this.playerVy),
+      playerVz: Math.round(this.playerVz),
+      autoFire: this.flightSettings.autoFire,
+      touchMode: this.flightSettings.touchMode,
+      altitudeKeys: this.flightSettings.altitudeKeys,
+      gamepadConnected: this.gamepadConnected,
+      coopActive: this.coopActive,
+      coopRole: this.coopRole,
+      coopRoomCode: this.coopRoomCode,
+      teammate: this.coopActive
+        ? {
+            active: true,
+            callsign: this.teammateCallsign,
+            skin: this.teammateSkin,
+            weapon: this.teammateWeapon,
+            hp: Math.round(this.teammateHp),
+            maxHp: Math.round(this.teammateMaxHp),
+            shield: Math.round(this.teammateShield),
+            maxShield: Math.round(this.teammateMaxShield),
+            downed: this.teammateDowned,
+            reviveProgress: Math.round(
+              this.playerDowned ? this.playerReviveProgress : this.teammateReviveProgress,
+            ),
+            x: this.teammateX,
+            y: this.teammateY,
+            z: this.teammateZ,
+            isAi: this.coopRole === 'ai_wingman',
+          }
+        : undefined,
+      squadronLinkActive: linkActive,
+      squadronFusionDocked: this.squadronFusionDocked,
+      squadronLinkEnergy: Math.round(this.squadronLinkEnergy),
+      squadronLinkCooldownRemaining: Math.max(
+        0,
+        Math.ceil(this.squadronLinkCooldownTimer),
+      ),
+      activePing: this.activePing ? { ...this.activePing } : null,
+      roguePerks: { ...this.roguePerks },
+      draftPending: this.draftPending,
+      draftChoices: [...this.draftChoices],
+      grazeCount: this.grazeCount,
+      grazeSlowMoActive: this.grazeSlowMoTimer > 0,
+      radarBlips: this.buildRadarBlips(),
+      fpsQuality: this.fpsQuality,
     });
   }
 
@@ -2993,14 +4329,90 @@ export class WobGameEngine {
     const shakeX = shakeMag > 0.1 ? (Math.random() * 2 - 1) * shakeMag : 0;
     const shakeY = shakeMag > 0.1 ? (Math.random() * 2 - 1) * shakeMag : 0;
 
-    ctx.fillStyle = '#0b0f19';
-    ctx.fillRect(0, 0, this.width, this.height);
+    const tetherDist = Math.hypot(
+      this.playerX - this.teammateX,
+      this.playerY - this.teammateY,
+    );
+    const linkActive =
+      this.coopActive &&
+      !this.teammateDowned &&
+      !this.playerDowned &&
+      (this.squadronLinkActiveTimer > 0 || tetherDist <= SQUADRON_TETHER_MAX_DIST);
+
+    // Render 3D WebGL Scene (Three.js) first
+    const rendered3D = this.renderer3d.render(
+      {
+        width: this.width,
+        height: this.height,
+        time: this.titleTime,
+        isTitle: this.gameState === 'title',
+        quality: this.fpsQuality,
+        shakeX,
+        shakeY,
+        playerX: this.playerX,
+        playerY: this.playerY,
+        playerZ: this.playerZ,
+        playerVx: this.playerVx,
+        playerVy: this.playerVy,
+        playerVz: this.playerVz,
+        playerAngle: this.playerAngle,
+        playerSkin: this.selectedShipSkin,
+        playerWeapon: this.selectedWeapon,
+        playerHitFlash: this.playerHitFlash,
+        playerInvuln: this.playerInvuln,
+        playerShield: this.playerShield,
+        tacticalShieldActive: this.tacticalShieldActiveTimer > 0,
+        tacticalShieldPulse: this.tacticalShieldPulse,
+        dashRatio: this.dashTimer > 0 ? this.dashTimer / this.dashDuration : 0,
+        hangarLevels: this.hangarLevels,
+        isDying: this.isDyingSequence,
+        pollyActive: this.pollyActiveTimer > 0,
+        pollyX: this.pollyX,
+        pollyY: this.pollyY,
+        pollyAngle: this.pollyAngle,
+        pollyBeamFlash: this.pollyBeamFlashTimer,
+        pollyBeamTargetX: this.pollyBeamTargetX,
+        pollyBeamTargetY: this.pollyBeamTargetY,
+        twinPollyActive: this.roguePerks.twin_polly > 0,
+        twinPollyX: this.twinPollyX,
+        twinPollyY: this.twinPollyY,
+        twinPollyAngle: this.twinPollyAngle,
+        coopActive: this.coopActive,
+        teammateX: this.teammateX,
+        teammateY: this.teammateY,
+        teammateVx: this.teammateVx,
+        teammateVy: this.teammateVy,
+        teammateAngle: this.teammateAngle,
+        teammateSkin: this.teammateSkin,
+        teammateDowned: this.teammateDowned,
+        squadronLinkActive: linkActive,
+        squadronFusionDocked: this.squadronFusionDocked,
+        empActive: this.empWaveActive,
+        empX: this.empWaveX,
+        empY: this.empWaveY,
+        empRadius: this.empWaveRadius,
+        empAlpha: this.empWaveAlpha,
+        enemies: this.enemies,
+        bullets: this.bullets,
+        orbs: this.orbs,
+        particles: this.particles,
+        hazards: this.hazards,
+      },
+      ctx,
+    );
+
+    if (!rendered3D) {
+      ctx.fillStyle = '#070b14';
+      ctx.fillRect(0, 0, this.width, this.height);
+    }
 
     ctx.save();
     ctx.translate(shakeX, shakeY);
 
-    this.renderCyberGrid(ctx);
-    this.renderAmbientMotes(ctx);
+    if (!rendered3D) {
+      this.renderCyberGrid(ctx);
+      this.renderAmbientMotes(ctx);
+    }
 
     if (this.gameState === 'title') {
       this.renderTitleHeroCore(ctx);
@@ -3032,20 +4444,49 @@ export class WobGameEngine {
       ctx.restore();
     }
 
-    this.renderOrbs(ctx);
-    this.renderHazards(ctx);
+    // High-voltage Co-op Squadron Energy Tether Overlay
+    if (linkActive && !this.squadronFusionDocked) {
+      this.renderSquadronTetherOverlay(ctx);
+    }
+
+    // Chain-Lightning Projectile Arcs
+    for (const arc of this.lightningArcs) {
+      ctx.save();
+      ctx.strokeStyle = arc.color;
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(arc.x1, arc.y1);
+      const midX = (arc.x1 + arc.x2) * 0.5 + (Math.random() - 0.5) * 24;
+      const midY = (arc.y1 + arc.y2) * 0.5 + (Math.random() - 0.5) * 24;
+      ctx.lineTo(midX, midY);
+      ctx.lineTo(arc.x2, arc.y2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    if (!rendered3D) {
+      this.renderOrbs(ctx);
+      this.renderHazards(ctx);
+    }
     this.renderAfterimages(ctx);
     this.renderEnemies(ctx);
-    this.renderBullets(ctx);
+    if (!rendered3D) {
+      this.renderBullets(ctx);
+    }
 
     if (!this.isDyingSequence) {
       this.renderPlayer(ctx);
+      if (this.coopActive) {
+        this.renderCoopTeammateOverlay(ctx);
+      }
       if (this.pollyActiveTimer > 0) {
         this.renderPollyWingman(ctx);
       }
     }
 
-    this.renderParticles(ctx);
+    if (!rendered3D) {
+      this.renderParticles(ctx);
+    }
     this.renderLabels(ctx);
 
     if (this.pointerActive && this.gameState === 'playing') {
@@ -3115,6 +4556,85 @@ export class WobGameEngine {
     ctx.restore();
   }
 
+  private renderSquadronTetherOverlay(ctx: CanvasRenderingContext2D): void {
+    ctx.save();
+    ctx.strokeStyle =
+      this.squadronLinkActiveTimer > 0
+        ? 'rgba(0, 245, 212, 0.95)'
+        : 'rgba(192, 132, 252, 0.7)';
+    ctx.lineWidth = this.squadronLinkActiveTimer > 0 ? 4.5 : 2.5;
+    ctx.beginPath();
+    ctx.moveTo(this.playerX, this.playerY);
+    const segments = 6;
+    for (let i = 1; i < segments; i++) {
+      const t = i / segments;
+      const lx =
+        this.playerX +
+        (this.teammateX - this.playerX) * t +
+        Math.sin(this.titleTime * 32 + i) * 7;
+      const ly =
+        this.playerY +
+        (this.teammateY - this.playerY) * t +
+        Math.cos(this.titleTime * 32 + i) * 7;
+      ctx.lineTo(lx, ly);
+    }
+    ctx.lineTo(this.teammateX, this.teammateY);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  private renderCoopTeammateOverlay(ctx: CanvasRenderingContext2D): void {
+    ctx.save();
+    const mx = this.squadronFusionDocked ? this.playerX : this.teammateX;
+    const my = this.squadronFusionDocked ? this.playerY + 18 : this.teammateY;
+
+    if (this.teammateDowned || this.playerDowned) {
+      const bx = this.teammateDowned ? this.teammateX : this.playerX;
+      const by = this.teammateDowned ? this.teammateY : this.playerY;
+      const prog =
+        (this.teammateDowned
+          ? this.teammateReviveProgress
+          : this.playerReviveProgress) / 100;
+
+      ctx.strokeStyle = 'rgba(255, 42, 95, 0.65)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      ctx.arc(bx, by, 95, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.strokeStyle = '#a3ff12';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(bx, by, 28, -Math.PI / 2, -Math.PI / 2 + prog * Math.PI * 2);
+      ctx.stroke();
+
+      ctx.font = '700 11px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ff2a5f';
+      ctx.fillText(
+        `REVIVE BEACON · ${Math.round(prog * 100)}%`,
+        bx,
+        by - 36,
+      );
+      ctx.restore();
+      return;
+    }
+
+    ctx.font = '700 10px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = getShipSkinConfig(this.teammateSkin).hullColor;
+    ctx.fillText(
+      this.squadronFusionDocked
+        ? `TWIN-CORE GUNSHIP [${this.teammateCallsign}]`
+        : this.teammateCallsign,
+      mx,
+      my - 22,
+    );
+    ctx.restore();
+  }
+
   private renderCyberGrid(ctx: CanvasRenderingContext2D): void {
     const gridSize = 56;
     const parallaxX =
@@ -3138,9 +4658,10 @@ export class WobGameEngine {
           : this.comboMultiplier >= 2
             ? '163, 255, 18'
             : '30, 58, 95';
-    const comboPulse = this.comboMultiplier > 1
-      ? 0.28 + Math.sin(this.titleTime * (2 + this.comboMultiplier * 0.45)) * 0.08
-      : 0.28;
+    const comboPulse =
+      this.comboMultiplier > 1
+        ? 0.28 + Math.sin(this.titleTime * (2 + this.comboMultiplier * 0.45)) * 0.08
+        : 0.28;
     ctx.strokeStyle = `rgba(${comboColor}, ${comboPulse})`;
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -3153,13 +4674,6 @@ export class WobGameEngine {
       ctx.lineTo(this.width, y);
     }
     ctx.stroke();
-
-    ctx.fillStyle = `rgba(${comboColor}, ${this.comboMultiplier > 1 ? 0.1 + comboPulse * 0.3 : 0.14})`;
-    for (let x = offsetX; x < this.width; x += gridSize * 2) {
-      for (let y = offsetY; y < this.height; y += gridSize * 2) {
-        ctx.fillRect(x - 1, y - 1, 2, 2);
-      }
-    }
     ctx.restore();
   }
 
@@ -3183,13 +4697,6 @@ export class WobGameEngine {
       ctx.lineWidth = 2;
       this.drawPolygon(ctx, 0, 0, hazard.radius, 8);
       ctx.fill();
-      ctx.stroke();
-      ctx.strokeStyle = 'rgba(255, 190, 130, 0.55)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(-hazard.radius * 0.45, -hazard.radius * 0.15);
-      ctx.lineTo(hazard.radius * 0.28, hazard.radius * 0.22);
-      ctx.lineTo(hazard.radius * 0.05, hazard.radius * 0.58);
       ctx.stroke();
       ctx.restore();
     }
@@ -3223,7 +4730,6 @@ export class WobGameEngine {
     ctx.arc(cx, cy, 130, 0, Math.PI * 2);
     ctx.fill();
 
-    // Tommy hero craft
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(this.playerAngle);
@@ -3231,7 +4737,6 @@ export class WobGameEngine {
     this.drawShipGeometry(ctx, false);
     ctx.restore();
 
-    // Polly partner craft orbiting Tommy in showcase
     ctx.save();
     ctx.translate(this.pollyX, this.pollyY);
     ctx.rotate(this.pollyAngle);
@@ -3250,7 +4755,7 @@ export class WobGameEngine {
       ctx.save();
     }
 
-    const stats = computePlayerStats(this.upgrades);
+    const stats = computePlayerStats(this.upgrades, this.hangarLevels);
 
     if (this.upgrades.magnet > 0) {
       ctx.save();
@@ -3263,7 +4768,6 @@ export class WobGameEngine {
       ctx.restore();
     }
 
-    // Passive armor shield ring
     if (this.playerShield > 0 && this.tacticalShieldActiveTimer <= 0) {
       const shieldAlpha = 0.28 + Math.sin(this.titleTime * 6) * 0.08;
       ctx.save();
@@ -3277,10 +4781,10 @@ export class WobGameEngine {
       ctx.restore();
     }
 
-    // Active Tactical Shield Barrier (absorbs damage & reflects bolts!)
-    if (this.tacticalShieldActiveTimer > 0) {
-      const pulse = 0.4 + Math.sin(this.titleTime * 16) * 0.12 + this.tacticalShieldPulse * 0.3;
-      const barrierR = this.playerRadius + 16;
+    if (this.tacticalShieldActiveTimer > 0 || this.squadronFusionDocked) {
+      const pulse =
+        0.4 + Math.sin(this.titleTime * 16) * 0.12 + this.tacticalShieldPulse * 0.3;
+      const barrierR = this.playerRadius + (this.squadronFusionDocked ? 24 : 16);
       ctx.save();
       ctx.translate(this.playerX, this.playerY);
 
@@ -3312,7 +4816,6 @@ export class WobGameEngine {
   }
 
   private renderPollyWingman(ctx: CanvasRenderingContext2D): void {
-    // Synchronized assist beam flash
     if (this.pollyBeamFlashTimer > 0) {
       ctx.save();
       ctx.globalAlpha = Math.min(1, this.pollyBeamFlashTimer * 10);
@@ -3548,54 +5051,10 @@ export class WobGameEngine {
         ctx.restore();
       }
 
+      ctx.save();
       ctx.rotate(e.angle);
 
-      if (e.kind === 'block') {
-        const s = e.radius * 1.5;
-        ctx.strokeStyle = flash ? 'rgba(255,255,255,0.4)' : 'rgba(255, 42, 95, 0.3)';
-        ctx.lineWidth = 6;
-        ctx.strokeRect(-s / 2, -s / 2, s, s);
-
-        ctx.fillStyle = flash ? '#ffffff' : 'rgba(255, 42, 95, 0.24)';
-        ctx.strokeStyle = flash ? '#ffffff' : '#ff2a5f';
-        ctx.lineWidth = 2;
-        ctx.fillRect(-s / 2, -s / 2, s, s);
-        ctx.strokeRect(-s / 2, -s / 2, s, s);
-        ctx.fillStyle = flash ? '#ffffff' : '#ff6b8b';
-        ctx.fillRect(-4, -4, 8, 8);
-      } else if (e.kind === 'firewall') {
-        this.drawPolygon(ctx, 0, 0, e.radius, 8);
-        ctx.strokeStyle = flash ? 'rgba(255,255,255,0.4)' : 'rgba(255, 0, 127, 0.3)';
-        ctx.lineWidth = 7;
-        ctx.stroke();
-
-        ctx.fillStyle = flash ? '#ffffff' : 'rgba(255, 0, 127, 0.22)';
-        ctx.strokeStyle = flash ? '#ffffff' : '#ff6b35';
-        ctx.lineWidth = 2.2;
-        ctx.fill();
-        ctx.stroke();
-
-        ctx.strokeStyle = flash ? '#ffffff' : '#ff007f';
-        this.drawPolygon(ctx, 0, 0, e.radius * 0.52, 4);
-        ctx.stroke();
-      } else if (e.kind === 'interceptor') {
-        ctx.beginPath();
-        ctx.moveTo(e.radius + 4, 0);
-        ctx.lineTo(-e.radius, -e.radius * 0.78);
-        ctx.lineTo(-e.radius * 0.45, 0);
-        ctx.lineTo(-e.radius, e.radius * 0.78);
-        ctx.closePath();
-
-        ctx.strokeStyle = flash ? 'rgba(255,255,255,0.4)' : 'rgba(255, 61, 113, 0.3)';
-        ctx.lineWidth = 6;
-        ctx.stroke();
-
-        ctx.fillStyle = flash ? '#ffffff' : 'rgba(255, 61, 113, 0.3)';
-        ctx.strokeStyle = flash ? '#ffffff' : '#ff3d71';
-        ctx.lineWidth = 2;
-        ctx.fill();
-        ctx.stroke();
-      } else if (e.kind === 'boss') {
+      if (e.kind === 'boss') {
         const sides = e.isChapterBoss ? 8 : 6;
         this.drawPolygon(ctx, 0, 0, e.radius, sides);
         ctx.strokeStyle = flash ? 'rgba(255,255,255,0.45)' : 'rgba(255, 0, 127, 0.34)';
@@ -3608,24 +5067,6 @@ export class WobGameEngine {
         ctx.fill();
         ctx.stroke();
 
-        ctx.rotate(-e.angle * 2);
-        ctx.strokeStyle = flash ? '#ffffff' : '#ff6b35';
-        ctx.lineWidth = 2.2;
-        this.drawPolygon(ctx, 0, 0, e.radius * 0.65, 4);
-        ctx.stroke();
-
-        if (e.isChapterBoss) {
-          ctx.strokeStyle = flash ? '#ffffff' : '#a3ff12';
-          ctx.lineWidth = 1.6;
-          this.drawPolygon(ctx, 0, 0, e.radius * 0.4, 6);
-          ctx.stroke();
-        }
-
-        ctx.fillStyle = flash ? '#ffffff' : '#ff2a5f';
-        ctx.beginPath();
-        ctx.arc(0, 0, e.isChapterBoss ? 11 : 9, 0, Math.PI * 2);
-        ctx.fill();
-
         if (e.isChapterBoss && !isDying) {
           ctx.save();
           ctx.rotate(e.angle * 2);
@@ -3633,10 +5074,47 @@ export class WobGameEngine {
           const pulse = 0.78 + Math.sin(this.titleTime * 9) * 0.22;
           ctx.globalAlpha = pulse;
           ctx.fillStyle = '#a3ff12';
-          ctx.shadowColor = '#a3ff12';
-          ctx.shadowBlur = 12;
           this.drawPolygon(ctx, 0, 0, 6, 4);
           ctx.fill();
+          ctx.restore();
+        }
+      }
+      ctx.restore();
+
+      // Render Capital Starship Destructible Subsystem Lock-On Brackets!
+      if (!isDying && e.kind === 'boss' && e.subsystems) {
+        for (const sub of e.subsystems) {
+          const lx = sub.worldX - e.x;
+          const ly = sub.worldY - e.y;
+          ctx.save();
+          ctx.translate(lx, ly);
+          if (sub.destroyed) {
+            ctx.strokeStyle = 'rgba(148, 163, 184, 0.45)';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(-6, -6);
+            ctx.lineTo(6, 6);
+            ctx.moveTo(6, -6);
+            ctx.lineTo(-6, 6);
+            ctx.stroke();
+          } else {
+            const bracketColor =
+              sub.hitFlash > 0
+                ? '#ffffff'
+                : sub.kind === 'central_core'
+                  ? '#a3ff12'
+                  : sub.kind === 'shield_gen'
+                    ? '#38bdf8'
+                    : '#ff6b35';
+            ctx.strokeStyle = bracketColor;
+            ctx.lineWidth = 1.8;
+            ctx.strokeRect(-10, -10, 20, 20);
+            const pct = Math.max(0, sub.hp / Math.max(1, sub.maxHp));
+            ctx.fillStyle = 'rgba(11, 15, 25, 0.85)';
+            ctx.fillRect(-11, -16, 22, 3.5);
+            ctx.fillStyle = bracketColor;
+            ctx.fillRect(-11, -16, 22 * pct, 3.5);
+          }
           ctx.restore();
         }
       }
@@ -3696,22 +5174,13 @@ export class WobGameEngine {
         ctx.beginPath();
         ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = '#ffffff';
-        ctx.beginPath();
-        ctx.arc(b.x, b.y, b.radius * 0.42, 0, Math.PI * 2);
-        ctx.fill();
       } else {
         const ang = Math.atan2(b.vy, b.vx);
         ctx.save();
         ctx.translate(b.x, b.y);
         ctx.rotate(ang);
-        ctx.globalAlpha = 0.28;
         ctx.fillStyle = b.color;
-        ctx.fillRect(-12, -4, 24, 8);
-        ctx.globalAlpha = 1;
         ctx.fillRect(-9, -2, 18, 4);
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(-5, -1, 12, 2);
         ctx.restore();
       }
     }
@@ -3727,11 +5196,6 @@ export class WobGameEngine {
       ctx.translate(orb.x, orb.y);
       ctx.scale(scale, scale);
 
-      ctx.fillStyle = 'rgba(56, 189, 248, 0.22)';
-      ctx.beginPath();
-      ctx.arc(0, 0, 11, 0, Math.PI * 2);
-      ctx.fill();
-
       ctx.fillStyle = '#38bdf8';
       ctx.beginPath();
       ctx.moveTo(0, -6.5);
@@ -3739,11 +5203,6 @@ export class WobGameEngine {
       ctx.lineTo(0, 6.5);
       ctx.lineTo(-5.5, 0);
       ctx.closePath();
-      ctx.fill();
-
-      ctx.fillStyle = '#e0f2fe';
-      ctx.beginPath();
-      ctx.arc(0, 0, 2.2, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
     }

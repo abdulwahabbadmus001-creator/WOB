@@ -6,11 +6,12 @@ import {
   getUpgradeCost,
   UPGRADE_CATALOG,
 } from '../game/rules';
-import type { HudSnapshot, UpgradeId } from '../game/types';
+import type { HudSnapshot, RogueDraftId, UpgradeId } from '../game/types';
 
 interface ShopModalProps {
   hud: HudSnapshot;
   onBuyUpgrade: (id: UpgradeId) => void;
+  onSelectRogueDraft?: (id: RogueDraftId) => void;
   onContinue: () => void;
 }
 
@@ -48,11 +49,13 @@ const UpgradeIcon: React.FC<{ id: UpgradeId; color: string }> = ({ id, color }) 
 export const ShopModal: React.FC<ShopModalProps> = ({
   hud,
   onBuyUpgrade,
+  onSelectRogueDraft,
   onContinue,
 }) => {
   const nextEpisode = Math.min(EPISODES_PER_CHAPTER, hud.episode + 1);
   const nextIsBoss10 = nextEpisode === EPISODES_PER_CHAPTER;
   const chapterBoss = computeChapterBossConfig(hud.chapter);
+  const draftPending = Boolean(hud.draftPending && hud.draftChoices && hud.draftChoices.length > 0);
 
   return (
     <div
@@ -64,7 +67,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({
     >
       <div className="animate-modal-enter w-full max-w-2xl max-h-[calc(100%-1rem)] overflow-y-auto bg-[#0e1424] border border-[#1e293b] rounded-xl p-4 sm:p-6 [@media(max-height:500px)]:p-3.5 shadow-[0_0_50px_rgba(0,245,212,0.14)]">
         {/* Header */}
-        <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2.5 sm:gap-3 pb-3 sm:pb-5 [@media(max-height:500px)]:pb-2 border-b border-slate-800">
+        <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2.5 sm:gap-3 pb-3 sm:pb-4 [@media(max-height:500px)]:pb-2 border-b border-slate-800">
           <div className="min-w-0">
             <p className="text-[11px] sm:text-xs [@media(max-height:500px)]:text-[10px] font-mono-num uppercase tracking-widest text-[#a3ff12]">
               Chapter {hud.chapter} · Episode {hud.episode}/{hud.episodesPerChapter}
@@ -100,19 +103,72 @@ export const ShopModal: React.FC<ShopModalProps> = ({
           </div>
         </div>
 
+        {/* Mid-Run Rogue-Lite Tactical Draft (Pick 1 of 3 stackable perks) */}
+        {draftPending && hud.draftChoices && onSelectRogueDraft && (
+          <div
+            data-testid="tactical-draft-section"
+            className="mt-3.5 bg-[#0b0f19] border border-[#00f5d4]/60 rounded-xl p-3 sm:p-4"
+          >
+            <div className="flex items-center justify-between gap-2 mb-2.5">
+              <span className="text-[11px] font-mono-num font-bold uppercase tracking-widest text-[#00f5d4]">
+                Mid-Run Tactical Draft · Pick 1 of 3 Free Stackable Perks
+              </span>
+              <span className="text-[10px] font-mono-num text-[#a3ff12]">
+                Rogue-Lite Overdrive
+              </span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              {hud.draftChoices.map((choice) => {
+                const stacks = hud.roguePerks?.[choice.id] ?? 0;
+                return (
+                  <button
+                    key={choice.id}
+                    type="button"
+                    data-testid={`draft-option-${choice.id}`}
+                    onClick={() => onSelectRogueDraft(choice.id)}
+                    className="text-left flex flex-col justify-between gap-2 bg-[#111827] border border-slate-700 hover:border-[#00f5d4] rounded-lg p-2.5 transition-all cursor-pointer group"
+                  >
+                    <div>
+                      <div className="flex items-center justify-between gap-1">
+                        <span
+                          className="font-display font-bold text-xs sm:text-sm"
+                          style={{ color: choice.accentColor }}
+                        >
+                          {choice.title}
+                        </span>
+                        {stacks > 0 && (
+                          <span className="font-mono-num text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-200">
+                            x{stacks}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-slate-300 mt-1 leading-snug">
+                        {choice.description}
+                      </p>
+                    </div>
+                    <span className="text-[10px] font-mono-num font-bold uppercase tracking-wider text-[#00f5d4] group-hover:underline">
+                      Draft Module →
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {nextIsBoss10 && (
           <div className="mt-3 [@media(max-height:500px)]:mt-2 bg-[#ff007f]/10 border border-[#ff007f]/60 rounded-lg px-3.5 py-2 [@media(max-height:500px)]:py-1.5">
             <p className="font-display text-xs sm:text-sm font-bold uppercase tracking-wider text-[#ff007f]">
-              Episode 10 Boss Warning · {chapterBoss.title}
+              Episode 10 Capital Dreadnought Warning · {chapterBoss.title}
             </p>
             <p className="text-xs text-slate-300 mt-0.5 [@media(max-height:500px)]:hidden">
-              {chapterBoss.subtitle}. Defeat resets Chapter {hud.chapter} back to Episode 1.
+              {chapterBoss.subtitle}. Target its destructible subsystems to disable weapons!
             </p>
           </div>
         )}
 
         {/* 4 Tactical Upgrades for Tommy */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 sm:gap-3.5 [@media(max-height:500px)]:gap-2 my-3.5 sm:my-5 [@media(max-height:500px)]:my-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 sm:gap-3.5 [@media(max-height:500px)]:gap-2 my-3.5 sm:my-4 [@media(max-height:500px)]:my-2">
           {UPGRADE_CATALOG.map((cfg) => {
             const level = hud.upgrades[cfg.id];
             const isMaxed = level >= cfg.maxLevel;
@@ -184,7 +240,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-2.5 pt-3.5 sm:pt-4 [@media(max-height:500px)]:pt-2 border-t border-slate-800">
           <p className="text-xs text-slate-400 font-mono-num">
             {nextIsBoss10
-              ? `Polly standby ready for Episode 10 Boss Encounter`
+              ? `Polly standby ready for Episode 10 Dreadnought Encounter`
               : `Next: Chapter ${hud.chapter} · Episode ${nextEpisode}/${hud.episodesPerChapter}`}
           </p>
           <button

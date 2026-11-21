@@ -5,11 +5,15 @@ import type { LeaderboardEntry } from '../game/types';
 
 interface LeaderboardModalProps {
   entries: readonly LeaderboardEntry[];
+  pendingSyncCount?: number;
+  isOnline?: boolean;
   onClose: () => void;
 }
 
 export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
   entries,
+  pendingSyncCount = 0,
+  isOnline = true,
   onClose,
 }) => {
   useEffect(() => {
@@ -34,9 +38,24 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
       <div className="animate-modal-enter w-full max-w-2xl max-h-[calc(100%-1rem)] overflow-y-auto bg-[#0e1424] border border-[#1e293b] rounded-xl p-4 sm:p-7 [@media(max-height:500px)]:p-4 shadow-[0_0_50px_rgba(0,245,212,0.14)]">
         <div className="flex items-center justify-between gap-4 pb-4 border-b border-slate-800">
           <div>
-            <p className="text-xs font-mono-num uppercase tracking-widest text-[#a3ff12]">
-              WOB · Top 10 Local Records
-            </p>
+            <div className="flex items-center gap-2">
+              <p className="text-xs font-mono-num uppercase tracking-widest text-[#a3ff12]">
+                WOB · Top 10 Local &amp; Synced Records
+              </p>
+              <span
+                className={`text-[10px] font-mono-num px-2 py-0.5 rounded border ${
+                  !isOnline || pendingSyncCount > 0
+                    ? 'border-[#fbbf24]/60 text-[#fbbf24] bg-[#fbbf24]/10'
+                    : 'border-[#00f5d4]/60 text-[#00f5d4] bg-[#00f5d4]/10'
+                }`}
+              >
+                {!isOnline
+                  ? `Offline Mode (${pendingSyncCount} Queued)`
+                  : pendingSyncCount > 0
+                    ? `Syncing ${pendingSyncCount}...`
+                    : 'All Records Synced'}
+              </span>
+            </div>
             <h2
               id="leaderboard-title"
               className="font-display text-2xl sm:text-3xl font-bold text-slate-100 mt-0.5"
@@ -108,13 +127,19 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
                         <span className="font-mono-num uppercase text-slate-400">
                           {entry.mode}
                         </span>
+                        {entry.coop && (
+                          <span className="font-mono-num text-[10px] px-1.5 py-0.2 rounded bg-[#c084fc]/20 text-[#c084fc]">
+                            CO-OP
+                          </span>
+                        )}
                         <span className="hidden sm:inline text-slate-600">·</span>
                         <span className="hidden sm:inline font-mono-num text-slate-400">
                           {entry.maxCombo}x Max
                         </span>
                       </div>
                       <span className="text-[11px] font-mono-num text-slate-500">
-                        {formatLeaderboardDate(entry.dateIso)}
+                        {formatLeaderboardDate(entry.dateIso)}{' '}
+                        {entry.synced === false ? '· Queued Offline' : ''}
                       </span>
                     </div>
                   </div>

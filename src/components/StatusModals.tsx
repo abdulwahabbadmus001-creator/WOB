@@ -1,10 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import { formatShareRunText } from '../game/leaderboard';
 import { computeChapterBossConfig } from '../game/rules';
-import type { HudSnapshot, RunSummary } from '../game/types';
+import type {
+  AltitudeKeyMode,
+  FlightControlSettings,
+  HudSnapshot,
+  RunSummary,
+  TouchControlMode,
+} from '../game/types';
 
 interface PauseModalProps {
   hud: HudSnapshot;
+  flightSettings?: FlightControlSettings;
+  onUpdateFlightSettings?: (next: FlightControlSettings) => void;
   onResume: () => void;
   onRestart: () => void;
   onTitle: () => void;
@@ -12,6 +20,8 @@ interface PauseModalProps {
 
 export const PauseModal: React.FC<PauseModalProps> = ({
   hud,
+  flightSettings,
+  onUpdateFlightSettings,
   onResume,
   onRestart,
   onTitle,
@@ -30,10 +40,72 @@ export const PauseModal: React.FC<PauseModalProps> = ({
         </p>
         <h2
           id="pause-title"
-          className="font-display text-3xl font-bold text-slate-100 mt-1 mb-6"
+          className="font-display text-3xl font-bold text-slate-100 mt-1 mb-4"
         >
           Mission Paused
         </h2>
+
+        {/* 6-DOF Manual Flight & Touch Control Settings */}
+        {flightSettings && onUpdateFlightSettings && (
+          <div className="mb-5 bg-[#0b0f19] border border-slate-800 rounded-lg p-3.5 space-y-2.5 text-xs">
+            <p className="text-[10px] font-mono-num uppercase tracking-widest text-[#00f5d4]">
+              6-Direction Manual Flight Settings
+            </p>
+
+            <label className="flex items-center justify-between gap-2 text-slate-300">
+              <span>Mobile Touch Mode</span>
+              <select
+                aria-label="Mobile Touch Mode"
+                value={flightSettings.touchMode}
+                onChange={(e) =>
+                  onUpdateFlightSettings({
+                    ...flightSettings,
+                    touchMode: e.target.value as TouchControlMode,
+                  })
+                }
+                className="rounded border border-slate-700 bg-[#111827] px-2.5 py-1 text-xs font-semibold text-slate-100"
+              >
+                <option value="dual_stick">Floating Stick + Altitude</option>
+                <option value="direct_touch">1:1 Direct Finger Tracking</option>
+              </select>
+            </label>
+
+            <label className="flex items-center justify-between gap-2 text-slate-300">
+              <span>Up / Down Elevation Keys</span>
+              <select
+                aria-label="Up / Down Elevation Keys"
+                value={flightSettings.altitudeKeys}
+                onChange={(e) =>
+                  onUpdateFlightSettings({
+                    ...flightSettings,
+                    altitudeKeys: e.target.value as AltitudeKeyMode,
+                  })
+                }
+                className="rounded border border-slate-700 bg-[#111827] px-2.5 py-1 text-xs font-semibold text-slate-100"
+              >
+                <option value="space_shift">Space (Up) / Shift (Down)</option>
+                <option value="q_e">Q (Up) / E (Down)</option>
+                <option value="r_f">R (Up) / F (Down)</option>
+              </select>
+            </label>
+
+            <div className="flex items-center justify-between gap-2 text-slate-300 pt-1">
+              <span>Weapon Trigger</span>
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateFlightSettings({
+                    ...flightSettings,
+                    autoFire: !flightSettings.autoFire,
+                  })
+                }
+                className="px-2.5 py-1 rounded bg-[#111827] border border-slate-700 font-mono-num text-[11px] font-bold text-[#00f5d4] cursor-pointer"
+              >
+                {flightSettings.autoFire ? 'Auto-Fire ON' : 'Manual Trigger [J]'}
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="flex flex-col gap-3">
           <button

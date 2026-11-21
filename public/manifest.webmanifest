@@ -1,16 +1,17 @@
 {
-  "id": "/",
-  "name": "WOB — Tommy & Polly",
+  "id": "/?source=pwa",
+  "name": "WOB: Tommy & Polly",
   "short_name": "WOB",
-  "description": "A cyberpunk survival shooter starring Tommy and his combat partner Polly.",
-  "start_url": "/",
+  "description": "WOB: Tommy & Polly — 100% offline-capable 3D arcade space shooter with 2-Player Co-op Squadron Campaign & capital starship battles.",
+  "start_url": "/?source=pwa",
   "scope": "/",
-  "display": "fullscreen",
-  "display_override": ["fullscreen", "standalone"],
-  "orientation": "landscape",
-  "background_color": "#060911",
-  "theme_color": "#060911",
-  "categories": ["games"],
+  "display": "standalone",
+  "display_override": ["standalone", "fullscreen"],
+  "orientation": "any",
+  "background_color": "#070b14",
+  "theme_color": "#00f5d4",
+  "categories": ["games", "action", "arcade"],
+  "prefer_related_applications": false,
   "icons": [
     {
       "src": "/icons/wob-icon-192.png",
@@ -19,8 +20,26 @@
       "purpose": "any"
     },
     {
+      "src": "/icons/wob-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
       "src": "/icons/wob-icon-512.png",
       "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/wob-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/wob-icon-180.png",
+      "sizes": "180x180",
       "type": "image/png",
       "purpose": "any"
     },

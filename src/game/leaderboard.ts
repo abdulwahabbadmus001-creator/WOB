@@ -64,9 +64,12 @@ export function insertLeaderboardEntry(
     maxCombo: number;
     mode?: GameMode;
     dateIso?: string;
+    synced?: boolean;
+    coop?: boolean;
   },
 ): LeaderboardEntry[] {
   const cleanScore = Math.max(0, Math.round(input.score));
+  const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
   const entry: LeaderboardEntry = {
     id: `wob-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     initials: sanitizeInitials(input.initials),
@@ -79,6 +82,8 @@ export function insertLeaderboardEntry(
     maxCombo: Math.max(1, Math.round(input.maxCombo)),
     mode: input.mode ?? 'campaign',
     dateIso: input.dateIso ?? new Date().toISOString(),
+    synced: input.synced ?? isOnline,
+    coop: input.coop,
   };
 
   return sortLeaderboard([...entries, entry]);
@@ -122,6 +127,8 @@ export function loadLeaderboard(
           typeof obj.dateIso === 'string'
             ? obj.dateIso
             : new Date(0).toISOString(),
+        synced: obj.synced ?? true,
+        coop: obj.coop,
       });
     }
     return sortLeaderboard(valid);

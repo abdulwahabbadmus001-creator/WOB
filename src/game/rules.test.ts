@@ -33,6 +33,15 @@ import {
   saveHighScore,
   TACTICAL_SHIELD_COOLDOWN,
   TACTICAL_SHIELD_DURATION,
+  applyHangarUpgradePurchase,
+  computeCoopScaling,
+  createBossSubsystems,
+  createInitialHangarUpgrades,
+  loadFlightControlSettings,
+  loadSavedCampaignProgress,
+  pickRogueDraftChoices,
+  saveCampaignProgress,
+  saveFlightControlSettings,
 } from './rules';
 
 test('upgrade cost and purchase flow deduct shards and cap at maxLevel', () => {
@@ -269,4 +278,64 @@ test('high-score milestones unlock and persist cosmetic ship skins', () => {
   assert.equal(memory.get(SHIP_SKIN_STORAGE_KEY), 'violet');
   assert.equal(loadShipSkin(4999, storage), 'cyan');
   assert.equal(loadShipSkin(5000, storage), 'violet');
+});
+
+test('3D Hangar upgrades, Rogue-Lite drafts, Capital Starship subsystems, and Co-op scaling work cleanly', () => {
+  const initialHangar = { scrap: 60, levels: createInitialHangarUpgrades() };
+  const bought = applyHangarUpgradePurchase('thruster', initialHangar);
+  assert.equal(bought.purchased, true);
+  assert.equal(bought.state.levels.thruster, 1);
+  assert.ok(bought.state.scrap < 60);
+
+  const draft = pickRogueDraftChoices(0.42);
+  assert.equal(draft.length, 3);
+  assert.notEqual(draft[0]?.id, draft[1]?.id);
+
+  const bossSubs = createBossSubsystems(2200, true);
+  assert.equal(bossSubs.length, 4);
+  assert.ok(bossSubs.some((s) => s.kind === 'shield_gen'));
+  assert.ok(bossSubs.some((s) => s.kind === 'central_core'));
+
+  const soloScale = computeCoopScaling(false);
+  const coopScale = computeCoopScaling(true);
+  assert.equal(soloScale.bossHpMult, 1);
+  assert.ok(coopScale.bossHpMult > 1.5);
+});
+
+test('6-Direction flight control settings and offline campaign/shard progress persist cleanly', () => {
+  const mem = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => mem.get(key) ?? null,
+    setItem: (key: string, val: string) => mem.set(key, val),
+  };
+
+  const defaultFlight = loadFlightControlSettings(storage);
+  assert.equal(defaultFlight.touchMode, 'dual_stick');
+  assert.equal(defaultFlight.altitudeKeys, 'space_shift');
+  assert.equal(defaultFlight.autoFire, true);
+  assert.equal(defaultFlight.inertialDampening, true);
+
+  saveFlightControlSettings(
+    {
+      touchMode: 'direct_touch',
+      altitudeKeys: 'q_e',
+      autoFire: false,
+      inertialDampening: true,
+    },
+    storage,
+  );
+  const loadedFlight = loadFlightControlSettings(storage);
+  assert.equal(loadedFlight.touchMode, 'direct_touch');
+  assert.equal(loadedFlight.altitudeKeys, 'q_e');
+  assert.equal(loadedFlight.autoFire, false);
+
+  saveCampaignProgress(
+    { highestChapter: 4, lastChapter: 3, lastEpisode: 7, bankedShards: 185 },
+    storage,
+  );
+  const loadedProg = loadSavedCampaignProgress(storage);
+  assert.equal(loadedProg.highestChapter, 4);
+  assert.equal(loadedProg.lastChapter, 3);
+  assert.equal(loadedProg.lastEpisode, 7);
+  assert.equal(loadedProg.bankedShards, 185);
 });
